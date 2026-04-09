@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+.idea/
+runs/
+
+# datasets and generated artifacts
+data/
+checkpoints/
+*.pt
+

@@ -1,0 +1,66 @@
+experiment:
+  name: "paper_tfa_conformer_sid"
+  output_dir: "runs"
+
+runtime:
+  seed: 42
+  device: "cuda"
+
+data:
+  # 可同时配置多个数据根目录，例如 TIMIT 与 ST-CMDS
+  roots:
+    - "data/TIMIT"
+    - "data/ST-CMDS"
+  extensions: [".wav", ".flac"]
+  # speaker_level=1 表示说话人 ID 为音频文件的父目录名
+  speaker_level: 1
+  sample_rate: 16000
+  segment_seconds: 2.5
+  # 论文中训练/验证/测试划分比例约为 3:1:1
+  split_ratio: [0.6, 0.2, 0.2]
+  split_seed: 42
+  train_batch_size: 64
+  eval_batch_size: 64
+  num_workers: 4
+  pin_memory: true
+
+feature:
+  # 论文设置：MFCC + 25ms 窗长 + 10ms 帧移 + n_fft=256
+  type: "mfcc"
+  n_mfcc: 80
+  n_mels: 80
+  n_fft: 256
+  win_length_ms: 25.0
+  hop_length_ms: 10.0
+  f_min: 20.0
+  f_max: 7600.0
+  cmvn: true
+
+model:
+  # num_speakers 会在训练时自动覆盖为扫描到的说话人数
+  num_speakers: 855
+  in_channels: 1
+  feature_channels: 512
+  res2_scale: 6
+  num_conformer_blocks: 3
+  num_heads: 4
+  ff_mult: 4
+  conv_kernel_t: 17
+  conv_kernel_f: 3
+  ce_reduction: 8
+  embedding_dim: 256
+  dropout: 0.1
+
+train:
+  epochs: 50
+  lr: 0.0005
+  weight_decay: 0.0001
+  # 近似论文“每 650 step 衰减”的设置
+  scheduler_step_size: 650
+  scheduler_gamma: 0.97
+  grad_clip: 5.0
+  amp: true
+  label_smoothing: 0.0
+  log_interval: 20
+  save_every_epoch: false
+
