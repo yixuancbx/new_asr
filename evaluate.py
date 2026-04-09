@@ -48,13 +48,23 @@ def main() -> None:
     )
     print(f"[Runtime] device={device}")
 
+    print("正在扫描数据集目录，请稍候...", flush=True)
     samples = scan_speaker_samples(cfg.data)
+    print("扫描完成！正在构建 DataLoader...", flush=True)
+
+    print("正在构建说话人标签映射...", flush=True)
     label_map = build_label_map(samples)
+    print(f"标签映射完成，共 {len(label_map)} 位说话人。", flush=True)
+
+    print("正在按说话人划分测试集...", flush=True)
     _, _, test_samples = split_samples_per_speaker(
         samples=samples,
         ratios=cfg.data.split_ratio,
         seed=cfg.data.split_seed,
     )
+    print("数据划分完成。", flush=True)
+
+    print("正在初始化特征提取器并构建测试集 DataLoader...", flush=True)
     extractor = AudioFeatureExtractor(data_cfg=cfg.data, feature_cfg=cfg.feature)
     test_ds = SpeakerFeatureDataset(
         samples=test_samples, label_map=label_map, extractor=extractor, training=False
@@ -67,6 +77,7 @@ def main() -> None:
         pin_memory=bool(cfg.data.pin_memory and torch.cuda.is_available()),
         collate_fn=speaker_batch_collate,
     )
+    print("测试集 DataLoader 构建完成。", flush=True)
 
     cfg.model.num_speakers = len(label_map)
     model = TFAMultiScaleConformerSpeakerNet(cfg.model).to(device)

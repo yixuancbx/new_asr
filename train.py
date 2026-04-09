@@ -55,15 +55,27 @@ def prepare_run_dir(cfg: ProjectConfig, run_name: str) -> Path:
 
 
 def build_dataloaders(cfg: ProjectConfig) -> Tuple[Dict[str, DataLoader], Dict[str, int]]:
+    print("正在扫描数据集目录，请稍候...", flush=True)
     samples = scan_speaker_samples(cfg.data)
+    print("扫描完成！正在构建 DataLoader...", flush=True)
+
+    print("正在构建说话人标签映射...", flush=True)
     label_map = build_label_map(samples)
+    print(f"标签映射完成，共 {len(label_map)} 位说话人。", flush=True)
+
+    print("正在按说话人划分训练/验证/测试集...", flush=True)
     train_samples, val_samples, test_samples = split_samples_per_speaker(
         samples=samples,
         ratios=cfg.data.split_ratio,
         seed=cfg.data.split_seed,
     )
+    print("数据划分完成。", flush=True)
 
+    print("正在初始化特征提取器...", flush=True)
     extractor = AudioFeatureExtractor(data_cfg=cfg.data, feature_cfg=cfg.feature)
+    print("特征提取器初始化完成。", flush=True)
+
+    print("正在构建 Dataset 对象...", flush=True)
     train_ds = SpeakerFeatureDataset(
         samples=train_samples, label_map=label_map, extractor=extractor, training=True
     )
@@ -73,6 +85,7 @@ def build_dataloaders(cfg: ProjectConfig) -> Tuple[Dict[str, DataLoader], Dict[s
     test_ds = SpeakerFeatureDataset(
         samples=test_samples, label_map=label_map, extractor=extractor, training=False
     )
+    print("Dataset 构建完成。", flush=True)
 
     common = {
         "num_workers": cfg.data.num_workers,
@@ -102,6 +115,7 @@ def build_dataloaders(cfg: ProjectConfig) -> Tuple[Dict[str, DataLoader], Dict[s
             **common,
         ),
     }
+    print("DataLoader 构建完成。", flush=True)
     print(
         f"[Data] 总样本={len(samples)} 训练={len(train_ds)} 验证={len(val_ds)} 测试={len(test_ds)} "
         f"说话人数={len(label_map)}"
