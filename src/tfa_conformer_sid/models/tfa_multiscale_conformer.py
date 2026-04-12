@@ -6,6 +6,7 @@ from typing import Dict, List, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as cp
 
 
 class LayerNorm2d(nn.Module):
@@ -400,7 +401,11 @@ class MultiScaleTFAEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor]:
         scale_feats: List[torch.Tensor] = []
         for block in self.blocks:
-            x = block(x)
+            # 开启梯度检查点，牺牲少量计算，换取更低显存占用
+            if self.training:
+                x = cp.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
             scale_feats.append(x)
 
         scale_weights = torch.softmax(self.scale_logits, dim=0)
