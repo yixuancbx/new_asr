@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional
 
@@ -39,6 +40,90 @@ def _iter_with_progress(loader: Iterable, desc: str):
         return loader
 
 
+def _resolve_loss_type(train_cfg: TrainingConfig) -> str:
+    loss_type = str(train_cfg.loss_type).strip().lower()
+    if loss_type not in {"ce", "arcface", "cosface"}:
+        raise ValueError("train.loss_type 仅支持: ce / arcface / cosface")
+    return loss_type
+
+
+def _build_margin_logits(
+    cosine_logits: torch.Tensor,
+    labels: torch.Tensor,
+    loss_type: str,
+    margin: float,
+    scale: float,
+    easy_margin: bool,
+) -> torch.Tensor:
+    cosine_logits = cosine_logits.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+
+    if loss_type == "arcface":
+        cos_m = math.cos(margin)
+        sin_m = math.sin(margin)
+        sine = torch.sqrt(torch.clamp(1.0 - cosine_logits.pow(2), min=1e-7))
+        phi = cosine_logits * cos_m - sine * sin_m
+
+        if easy_margin:
+            target_logits = torch.where(cosine_logits > 0, phi, cosine_logits)
+        else:
+            threshold = math.cos(math.pi - margin)
+            mm = math.sin(math.pi - margin) * margin
+            target_logits = torch.where(cosine_logits > threshold, phi, cosine_logits - mm)
+    elif loss_type == "cosface":
+        target_logits = cosine_logits - margin
+    else:
+        raise ValueError(f"不支持的 margin loss 类型: {loss_type}")
+
+    one_hot = F.one_hot(labels, num_classes=cosine_logits.size(1)).type_as(cosine_logits)
+    logits = (1.0 - one_hot) * cosine_logits + one_hot * target_logits
+    return logits * scale
+
+
+def _compute_loss_and_metric_logits(
+    outputs: Dict[str, torch.Tensor],
+    labels: torch.Tensor,
+    train_cfg: TrainingConfig,
+    loss_type: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if loss_type == "ce":
+        logits = outputs["logits"]
+        loss = F.cross_entropy(
+            logits,
+            labels,
+            label_smoothing=train_cfg.label_smoothing,
+        )
+        return loss, logits
+
+    cosine_logits = outputs.get("cosine_logits")
+    if cosine_logits is None:
+        raise KeyError("模型输出缺少 cosine_logits，无法计算 ArcFace/CosFace 损失")
+
+    margin = float(train_cfg.loss_margin)
+    scale = float(train_cfg.loss_scale)
+    if margin < 0:
+        raise ValueError("train.loss_margin 不能为负数")
+    if scale <= 0:
+        raise ValueError("train.loss_scale 必须大于 0")
+
+    logits_for_loss = _build_margin_logits(
+        cosine_logits=cosine_logits,
+        labels=labels,
+        loss_type=loss_type,
+        margin=margin,
+        scale=scale,
+        easy_margin=bool(train_cfg.loss_easy_margin),
+    )
+    loss = F.cross_entropy(
+        logits_for_loss,
+        labels,
+        label_smoothing=train_cfg.label_smoothing,
+    )
+
+    # 评估分类效果时使用不带 margin 的推理 logits，更接近实际推理场景
+    logits_for_metric = cosine_logits * scale
+    return loss, logits_for_metric
+
+
 def run_one_epoch(
     model: torch.nn.Module,
     loader,
@@ -53,6 +138,7 @@ def run_one_epoch(
 ) -> EpochResult:
     if train_mode and optimizer is None:
         raise ValueError("train_mode=True 时必须提供 optimizer")
+    loss_type = _resolve_loss_type(train_cfg)
 
     use_amp = bool(train_cfg.amp and device.type == "cuda")
     if train_mode:
@@ -77,10 +163,11 @@ def run_one_epoch(
 
             with torch.autocast(device_type=device.type, enabled=use_amp):
                 outputs = model(feats)
-                loss = F.cross_entropy(
-                    outputs["logits"],
-                    labels,
-                    label_smoothing=train_cfg.label_smoothing,
+                loss, metric_logits = _compute_loss_and_metric_logits(
+                    outputs=outputs,
+                    labels=labels,
+                    train_cfg=train_cfg,
+                    loss_type=loss_type,
                 )
 
             if train_mode:
@@ -108,8 +195,7 @@ def run_one_epoch(
                         f"loss={loss.item():.4f} lr={lr_now:.6g}"
                     )
 
-            logits = outputs["logits"]
-            preds = logits.argmax(dim=1)
+            preds = metric_logits.argmax(dim=1)
 
             batch_size = labels.size(0)
             total_loss += loss.item() * batch_size

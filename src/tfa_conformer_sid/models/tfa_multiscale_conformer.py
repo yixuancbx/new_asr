@@ -164,25 +164,69 @@ class HybridFeatureEncoder(nn.Module):
         return x3
 
 
+class DomainSeparableAttention1d(nn.Module):
+    """Pointwise + depthwise + pointwise branch for 1D attention."""
+
+    def __init__(
+        self,
+        channels: int = 32,
+        kernel_size: int = 7,
+        dilation: int = 3,
+    ) -> None:
+        super().__init__()
+        if channels < 1:
+            raise ValueError("channels must be >= 1")
+        if kernel_size < 1 or kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be positive odd integer")
+        if dilation < 1:
+            raise ValueError("dilation must be >= 1")
+
+        padding = dilation * (kernel_size - 1) // 2
+        self.net = nn.Sequential(
+            nn.Conv1d(1, channels, kernel_size=1, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(
+                channels,
+                channels,
+                kernel_size=kernel_size,
+                dilation=dilation,
+                padding=padding,
+                groups=channels,
+                bias=False,
+            ),
+            nn.BatchNorm1d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(channels, 1, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class TimeFrequencyAttentionPooling(nn.Module):
     """
     Time-frequency attention pooling:
     average pooling over channel -> temporal/frequency branches -> outer product.
     """
 
-    def __init__(self, hidden: int = 16) -> None:
+    def __init__(
+        self,
+        branch_channels: int = 32,
+        kernel_size: int = 7,
+        dilation: int = 3,
+    ) -> None:
         super().__init__()
-        self.temporal_mlp = nn.Sequential(
-            nn.Conv1d(1, hidden, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(hidden, 1, kernel_size=1),
-            nn.Sigmoid(),
+        self.temporal_branch = DomainSeparableAttention1d(
+            channels=branch_channels,
+            kernel_size=kernel_size,
+            dilation=dilation,
         )
-        self.frequency_mlp = nn.Sequential(
-            nn.Conv1d(1, hidden, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(hidden, 1, kernel_size=1),
-            nn.Sigmoid(),
+        self.frequency_branch = DomainSeparableAttention1d(
+            channels=branch_channels,
+            kernel_size=kernel_size,
+            dilation=dilation,
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -190,8 +234,8 @@ class TimeFrequencyAttentionPooling(nn.Module):
         temporal = pooled.mean(dim=2, keepdim=False).unsqueeze(1)  # [B, 1, T]
         frequency = pooled.mean(dim=1, keepdim=False).unsqueeze(1)  # [B, 1, F]
 
-        t_attn = self.temporal_mlp(temporal).squeeze(1)  # [B, T]
-        f_attn = self.frequency_mlp(frequency).squeeze(1)  # [B, F]
+        t_attn = self.temporal_branch(temporal).squeeze(1)  # [B, T]
+        f_attn = self.frequency_branch(frequency).squeeze(1)  # [B, F]
 
         tf_map = t_attn.unsqueeze(-1) * f_attn.unsqueeze(-2)  # [B, T, F]
         return x * tf_map.unsqueeze(1), tf_map
@@ -308,7 +352,11 @@ class TFAConformerBlock(nn.Module):
             kernel_f=conv_kernel_f,
             dropout=dropout,
         )
-        self.tfa_pool = TimeFrequencyAttentionPooling(hidden=16)
+        self.tfa_pool = TimeFrequencyAttentionPooling(
+            branch_channels=32,
+            kernel_size=7,
+            dilation=3,
+        )
         self.ffn2 = FFN2d(channels=channels, mult=ff_mult, dropout=dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -419,16 +467,14 @@ class TFAMultiScaleConformerSpeakerNet(nn.Module):
             channels=cfg.feature_channels,
             reduction=cfg.ce_reduction,
         )
-        self.emb_proj = nn.Linear(cfg.feature_channels * 2, cfg.embedding_dim)
+        self.emb_proj = nn.Linear(cfg.feature_channels, cfg.embedding_dim)
         self.emb_bn = nn.BatchNorm1d(cfg.embedding_dim)
         self.classifier = nn.Linear(cfg.embedding_dim, cfg.num_speakers)
 
     @staticmethod
     def _stats_pool(x: torch.Tensor) -> torch.Tensor:
-        flat = x.flatten(start_dim=2)  # [B, C, T*F]
-        mean = flat.mean(dim=2)
-        std = flat.std(dim=2, unbiased=False)
-        return torch.cat([mean, std], dim=1)
+        temporal_feature = x.mean(dim=3)  # [B, C, T]
+        return temporal_feature.mean(dim=2)  # [B, C]
 
     def forward(self, feat: torch.Tensor) -> Dict[str, torch.Tensor]:
         if feat.dim() == 3:
@@ -452,9 +498,11 @@ class TFAMultiScaleConformerSpeakerNet(nn.Module):
         embedding = self.emb_bn(embedding)
         embedding = F.normalize(embedding, p=2, dim=1)
         logits = self.classifier(embedding)
+        cosine_logits = F.linear(embedding, F.normalize(self.classifier.weight, p=2, dim=1))
 
         return {
             "logits": logits,
+            "cosine_logits": cosine_logits,
             "embedding": embedding,
             "scale_weights": scale_weights,
             "ce_gate": ce_gate,

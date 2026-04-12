@@ -18,6 +18,8 @@ class DataConfig:
     roots: List[str] = field(default_factory=lambda: ["data/TIMIT", "data/ST-CMDS"])
     extensions: List[str] = field(default_factory=lambda: [".wav", ".flac"])
     speaker_level: int = 1
+    max_samples_per_speaker: int = 6
+    speaker_sample_seed: int = 42
     sample_rate: int = 16000
     segment_seconds: float = 2.5
     split_ratio: List[float] = field(default_factory=lambda: [0.6, 0.2, 0.2])  # 3:1:1
@@ -51,6 +53,10 @@ class TrainingConfig:
     grad_clip: float = 5.0
     amp: bool = True
     label_smoothing: float = 0.0
+    loss_type: str = "arcface"  # ce | arcface | cosface
+    loss_margin: float = 0.2
+    loss_scale: float = 30.0
+    loss_easy_margin: bool = False
     log_interval: int = 20
     save_every_epoch: bool = False
 

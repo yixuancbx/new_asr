@@ -9,18 +9,22 @@ runtime:
 data:
   # 可同时配置多个数据根目录，例如 TIMIT 与 ST-CMDS
   roots:
-    - "data/TIMIT"
-    - "data/ST-CMDS"
+    - "D:\\VPN\\TIMIT\\raw\\data"
+    - "D:\\VPN\\ST-CMDS-20170001_1-OS"
   extensions: [".wav", ".flac"]
   # speaker_level=1 表示说话人 ID 为音频文件的父目录名
   speaker_level: 1
+  # 每位说话人最多使用的音频数量（<=0 表示不限制）
+  max_samples_per_speaker: 6
+  # 说话人内样本超限时的随机采样种子
+  speaker_sample_seed: 42
   sample_rate: 16000
   segment_seconds: 2.5
   # 论文中训练/验证/测试划分比例约为 3:1:1
   split_ratio: [0.6, 0.2, 0.2]
   split_seed: 42
-  train_batch_size: 64
-  eval_batch_size: 64
+  train_batch_size: 4
+  eval_batch_size: 4
   num_workers: 4
   pin_memory: true
 
@@ -29,7 +33,7 @@ feature:
   type: "mfcc"
   n_mfcc: 80
   n_mels: 80
-  n_fft: 256
+  n_fft: 512
   win_length_ms: 25.0
   hop_length_ms: 10.0
   f_min: 20.0
@@ -40,11 +44,11 @@ model:
   # num_speakers 会在训练时自动覆盖为扫描到的说话人数
   num_speakers: 855
   in_channels: 1
-  feature_channels: 512
+  feature_channels: 256
   res2_scale: 6
-  num_conformer_blocks: 3
+  num_conformer_blocks: 2
   num_heads: 4
-  ff_mult: 4
+  ff_mult: 2
   conv_kernel_t: 17
   conv_kernel_f: 3
   ce_reduction: 8
@@ -53,7 +57,7 @@ model:
 
 train:
   epochs: 50
-  lr: 0.0005
+  lr: 0.0002
   weight_decay: 0.0001
   # 近似论文“每 650 step 衰减”的设置
   scheduler_step_size: 650
@@ -61,6 +65,11 @@ train:
   grad_clip: 5.0
   amp: true
   label_smoothing: 0.0
-  log_interval: 20
+  # 分类损失: ce | arcface | cosface
+  loss_type: "arcface"
+  loss_margin: 0.2
+  loss_scale: 30.0
+  loss_easy_margin: false
+  log_interval: 0
   save_every_epoch: false
 

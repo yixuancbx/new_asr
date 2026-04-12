@@ -51,12 +51,20 @@ data/ST-CMDS/<speaker_id>/*.wav
 - `data.roots`
 - `data.extensions`
 - `data.speaker_level`
+- `data.max_samples_per_speaker`（每位说话人最多保留多少条音频，默认 6）
+- `data.speaker_sample_seed`（说话人内样本超限时的采样随机种子）
 
 ## 训练
 
 ```bash
 python train.py --config configs/paper_experiment.yaml
 ```
+
+支持主流分类损失配置（`train.loss_type`）：
+
+- `arcface`：AAM-Softmax（默认）
+- `cosface`：AM-Softmax
+- `ce`：普通 Softmax 交叉熵
 
 可恢复训练：
 
