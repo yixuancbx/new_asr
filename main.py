@@ -492,15 +492,14 @@ class TFAMultiScaleConformerSpeakerNet(nn.Module):
             channels=cfg.feature_channels,
             reduction=cfg.ce_reduction,
         )
-        self.emb_proj = nn.Linear(cfg.feature_channels, cfg.embedding_dim)
+        self.emb_proj = nn.LazyLinear(cfg.embedding_dim)
         self.emb_bn = nn.BatchNorm1d(cfg.embedding_dim)
         self.classifier = nn.Linear(cfg.embedding_dim, cfg.num_speakers)
 
     @staticmethod
     def _stats_pool(x: torch.Tensor) -> torch.Tensor:
         # x: [B, C, T, F]
-        temporal_feature = x.mean(dim=3)  # [B, C, T]
-        return temporal_feature.mean(dim=2)  # [B, C]
+        return x.mean(dim=2)  # [B, C, F]
 
     def forward(self, feat: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -524,7 +523,7 @@ class TFAMultiScaleConformerSpeakerNet(nn.Module):
         x, scales, scale_weights = self.tfa_encoder(x)
         x, ce_gate = self.ce_balance(x)
 
-        pooled = self._stats_pool(x)
+        pooled = self._stats_pool(x).flatten(start_dim=1)
         embedding = self.emb_proj(pooled)
         embedding = self.emb_bn(embedding)
         embedding = F.normalize(embedding, p=2, dim=1)
