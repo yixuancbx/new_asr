@@ -404,7 +404,10 @@ class MultiScaleTFAEncoder(nn.Module):
             scale_feats.append(x)
 
         scale_weights = torch.softmax(self.scale_logits, dim=0)
-        fused = sum(weight * feat for weight, feat in zip(scale_weights, scale_feats))
+        # 使用原地累加，降低多尺度融合阶段的峰值显存占用
+        fused = torch.zeros_like(scale_feats[0])
+        for weight, feat in zip(scale_weights, scale_feats):
+            fused += weight * feat
         return fused, scale_feats, scale_weights
 
 
