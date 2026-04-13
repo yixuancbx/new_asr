@@ -16,6 +16,7 @@ from tfa_conformer_sid.config import load_yaml_config
 from tfa_conformer_sid.dataio import (
     AudioFeatureExtractor,
     SpeakerFeatureDataset,
+    VideoROIExtractor,
     build_label_map,
     scan_speaker_samples,
     speaker_batch_collate,
@@ -65,9 +66,14 @@ def main() -> None:
     print("数据划分完成。", flush=True)
 
     print("正在初始化特征提取器并构建测试集 DataLoader...", flush=True)
-    extractor = AudioFeatureExtractor(data_cfg=cfg.data, feature_cfg=cfg.feature)
+    audio_extractor = AudioFeatureExtractor(data_cfg=cfg.data, feature_cfg=cfg.feature)
+    video_extractor = VideoROIExtractor(data_cfg=cfg.data)
     test_ds = SpeakerFeatureDataset(
-        samples=test_samples, label_map=label_map, extractor=extractor, training=False
+        samples=test_samples,
+        label_map=label_map,
+        audio_extractor=audio_extractor,
+        video_extractor=video_extractor,
+        training=False,
     )
     test_loader = DataLoader(
         test_ds,
@@ -81,6 +87,10 @@ def main() -> None:
 
     cfg.model.num_speakers = len(label_map)
     model = TFAMultiScaleConformerSpeakerNet(cfg.model).to(device)
+    print(
+        f"[Model] use_audio_branch={cfg.model.use_audio_branch} "
+        f"use_video_branch={cfg.model.use_video_branch}"
+    )
 
     ckpt = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])

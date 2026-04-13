@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional
 
@@ -124,6 +125,32 @@ def _compute_loss_and_metric_logits(
     return loss, logits_for_metric
 
 
+def _to_device_batch(feats, device: torch.device):
+    if isinstance(feats, dict):
+        moved = {}
+        for key, value in feats.items():
+            if torch.is_tensor(value):
+                moved[key] = value.to(device, non_blocking=True)
+            else:
+                moved[key] = value
+        return moved
+    return feats.to(device, non_blocking=True)
+
+
+def _apply_modality_dropout(feats, train_cfg: TrainingConfig, train_mode: bool):
+    if not train_mode or not isinstance(feats, dict):
+        return feats
+    p_video = min(max(float(train_cfg.modality_drop_video_prob), 0.0), 1.0)
+    p_audio = min(max(float(train_cfg.modality_drop_audio_prob), 0.0), 1.0)
+    if "video" in feats and p_video > 0 and random.random() < p_video:
+        feats["video"] = torch.zeros_like(feats["video"])
+        if "video_mask" in feats:
+            feats["video_mask"] = torch.zeros_like(feats["video_mask"])
+    if "audio" in feats and p_audio > 0 and random.random() < p_audio:
+        feats["audio"] = torch.zeros_like(feats["audio"])
+    return feats
+
+
 def run_one_epoch(
     model: torch.nn.Module,
     loader,
@@ -158,7 +185,8 @@ def run_one_epoch(
 
     with context():
         for step, (feats, labels) in enumerate(iter_loader, start=1):
-            feats = feats.to(device, non_blocking=True)
+            feats = _to_device_batch(feats, device=device)
+            feats = _apply_modality_dropout(feats, train_cfg=train_cfg, train_mode=train_mode)
             labels = labels.to(device, non_blocking=True)
 
             with torch.autocast(device_type=device.type, enabled=use_amp):

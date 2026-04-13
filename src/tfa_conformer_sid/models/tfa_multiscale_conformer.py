@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -445,6 +446,57 @@ class ClassifierSEBlock(nn.Module):
         return x * gate[:, :, None, None], gate
 
 
+def _build_resnet18_backbone() -> nn.Module:
+    try:
+        tv_models = importlib.import_module("torchvision.models")
+    except Exception as exc:
+        raise ImportError(
+            "视频分支依赖 torchvision，请安装：pip install torchvision"
+        ) from exc
+    backbone = tv_models.resnet18(weights=None)
+    backbone.fc = nn.Identity()
+    return backbone
+
+
+class VideoAttentionAggregator(nn.Module):
+    """Attention-based temporal aggregation for frame-wise video features."""
+
+    def __init__(self, in_dim: int, hidden_dim: int = 128) -> None:
+        super().__init__()
+        self.score = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        # x: [B, T, D]
+        score = self.score(x).squeeze(-1)  # [B, T]
+        if mask is not None:
+            score = score.masked_fill(mask <= 0, -1e4)
+        attn = torch.softmax(score, dim=1)
+        pooled = torch.sum(attn.unsqueeze(-1) * x, dim=1)
+        return pooled, attn
+
+
+class AdaptiveModalFusion(nn.Module):
+    """Adaptive fusion gate between audio/video embeddings."""
+
+    def __init__(self, emb_dim: int, hidden_dim: int = 256) -> None:
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.Linear(emb_dim * 2, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, emb_dim),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, audio_emb: torch.Tensor, video_emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        alpha = self.gate(torch.cat([audio_emb, video_emb], dim=1))
+        fused = alpha * audio_emb + (1.0 - alpha) * video_emb
+        return fused, alpha
+
+
 @dataclass
 class ModelConfig:
     num_speakers: int = 855
@@ -460,57 +512,99 @@ class ModelConfig:
     classifier_se_reduction: int = 8
     bottleneck_dim: int = 512
     embedding_dim: int = 1024
+    video_backbone_dim: int = 512
+    fusion_hidden_dim: int = 256
+    use_audio_branch: bool = True
+    use_video_branch: bool = True
+    use_attention_aggregation: bool = True
+    use_adaptive_fusion: bool = True
     dropout: float = 0.1
 
 
 class TFAMultiScaleConformerSpeakerNet(nn.Module):
     """
-    Multi-scale short-utterance speaker identification model with
-    SE-Res2 frame encoder + serial-flow TFA blocks + SE-enhanced classifier head.
+    Audio-video multi-modal SID model.
+    - Audio: SE-Res2 frame encoder + serial-flow TFA + SE classifier head
+    - Video: ResNet18 ROI encoder + attention aggregation
+    - Fusion: adaptive gate fusion (supports ablation by config switches)
     """
 
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
         self.cfg = cfg
-        self.feature_encoder = HybridFeatureEncoder(
-            in_channels=cfg.in_channels,
-            channels=cfg.feature_channels,
-            scale=cfg.res2_scale,
-            dropout=cfg.dropout,
-        )
-        self.tfa_encoder = MultiScaleTFAEncoder(
-            channels=cfg.feature_channels,
-            num_blocks=cfg.num_conformer_blocks,
-            num_heads=cfg.num_heads,
-            ff_mult=cfg.ff_mult,
-            conv_kernel_t=cfg.conv_kernel_t,
-            conv_kernel_f=cfg.conv_kernel_f,
-            dropout=cfg.dropout,
-        )
-        self.ce_balance = CompressionExcitationBalance(
-            channels=cfg.feature_channels,
-            reduction=cfg.ce_reduction,
-        )
-        self.classifier_se = ClassifierSEBlock(
-            channels=cfg.feature_channels,
-            reduction=cfg.classifier_se_reduction,
-        )
-        self.bottleneck_proj = nn.Linear(cfg.feature_channels, cfg.bottleneck_dim)
-        self.emb_proj = nn.Linear(cfg.bottleneck_dim, cfg.embedding_dim)
+        self.use_audio_branch = bool(cfg.use_audio_branch)
+        self.use_video_branch = bool(cfg.use_video_branch)
+        if not self.use_audio_branch and not self.use_video_branch:
+            raise ValueError("至少需要启用一个模态分支：audio 或 video")
+
+        if self.use_audio_branch:
+            self.feature_encoder = HybridFeatureEncoder(
+                in_channels=cfg.in_channels,
+                channels=cfg.feature_channels,
+                scale=cfg.res2_scale,
+                dropout=cfg.dropout,
+            )
+            self.tfa_encoder = MultiScaleTFAEncoder(
+                channels=cfg.feature_channels,
+                num_blocks=cfg.num_conformer_blocks,
+                num_heads=cfg.num_heads,
+                ff_mult=cfg.ff_mult,
+                conv_kernel_t=cfg.conv_kernel_t,
+                conv_kernel_f=cfg.conv_kernel_f,
+                dropout=cfg.dropout,
+            )
+            self.ce_balance = CompressionExcitationBalance(
+                channels=cfg.feature_channels,
+                reduction=cfg.ce_reduction,
+            )
+            self.classifier_se = ClassifierSEBlock(
+                channels=cfg.feature_channels,
+                reduction=cfg.classifier_se_reduction,
+            )
+            self.bottleneck_proj = nn.Linear(cfg.feature_channels, cfg.bottleneck_dim)
+            self.emb_proj = nn.Linear(cfg.bottleneck_dim, cfg.embedding_dim)
+        else:
+            self.feature_encoder = None
+            self.tfa_encoder = None
+            self.ce_balance = None
+            self.classifier_se = None
+            self.bottleneck_proj = None
+            self.emb_proj = None
+
+        if self.use_video_branch:
+            self.video_backbone = _build_resnet18_backbone()
+            with torch.no_grad():
+                backbone_dim = int(self.video_backbone(torch.zeros(1, 3, 112, 112)).shape[1])
+            self.video_aggregator = VideoAttentionAggregator(in_dim=backbone_dim)
+            self.video_proj = nn.Linear(backbone_dim, cfg.embedding_dim)
+        else:
+            self.video_backbone = None
+            self.video_aggregator = None
+            self.video_proj = None
+
+        if self.use_audio_branch and self.use_video_branch:
+            self.modal_fusion = AdaptiveModalFusion(
+                emb_dim=cfg.embedding_dim,
+                hidden_dim=cfg.fusion_hidden_dim,
+            )
+        else:
+            self.modal_fusion = None
+
         self.classifier = nn.Linear(cfg.embedding_dim, cfg.num_speakers)
 
     @staticmethod
     def _stats_pool(x: torch.Tensor) -> torch.Tensor:
         return x.mean(dim=(2, 3))  # [B, C]
 
-    def forward(self, feat: torch.Tensor) -> Dict[str, torch.Tensor]:
-        if feat.dim() == 3:
-            x = feat.unsqueeze(1)
-        elif feat.dim() == 4:
-            x = feat
+    def _encode_audio(self, audio_feat: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if not self.use_audio_branch:
+            raise RuntimeError("audio 分支未启用")
+        if audio_feat.dim() == 3:
+            x = audio_feat.unsqueeze(1)
+        elif audio_feat.dim() == 4:
+            x = audio_feat
         else:
-            raise ValueError("Input must be [B, T, F] or [B, 1, T, F].")
-
+            raise ValueError("audio 输入必须是 [B, T, F] 或 [B, 1, T, F]")
         if x.size(1) != self.cfg.in_channels:
             raise ValueError(
                 f"Input channel mismatch: expected {self.cfg.in_channels}, got {x.size(1)}."
@@ -524,26 +618,134 @@ class TFAMultiScaleConformerSpeakerNet(nn.Module):
         pooled = self._stats_pool(x)
         compressed = self.bottleneck_proj(pooled)
         compressed = F.normalize(compressed, p=2, dim=1)
-        embedding = self.emb_proj(compressed)
-        embedding_norm = F.normalize(embedding, p=2, dim=1)
-        logits = self.classifier(embedding_norm)
-        cosine_logits = F.linear(
-            embedding_norm,
-            F.normalize(self.classifier.weight, p=2, dim=1),
-        )
-        probabilities = torch.softmax(logits, dim=1)
-
-        return {
-            "logits": logits,
-            "cosine_logits": cosine_logits,
-            "probabilities": probabilities,
-            "embedding": embedding_norm,
-            "compressed_embedding": compressed,
+        audio_emb = self.emb_proj(compressed)
+        audio_emb = F.normalize(audio_emb, p=2, dim=1)
+        aux = {
             "scale_weights": scale_weights,
             "ce_gate": ce_gate,
             "classifier_se_gate": cls_se_gate,
             "final_feature_map": x,
             "multi_scale_features": torch.stack(scales, dim=1),
+            "compressed_embedding": compressed,
+        }
+        return audio_emb, aux
+
+    def _encode_video(
+        self,
+        video_feat: torch.Tensor,
+        video_mask: torch.Tensor | None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_video_branch:
+            raise RuntimeError("video 分支未启用")
+        if video_feat.dim() == 4:
+            video_feat = video_feat.unsqueeze(1)
+        if video_feat.dim() != 5:
+            raise ValueError("video 输入必须是 [B, T, 3, H, W] 或 [B, 3, H, W]")
+        if video_mask is not None:
+            video_mask = video_mask.float()
+
+        bsz, num_frames, channels, h, w = video_feat.shape
+        if channels != 3:
+            raise ValueError(f"video 通道必须为 3，当前为 {channels}")
+
+        flat = video_feat.reshape(bsz * num_frames, channels, h, w)
+        frame_features = self.video_backbone(flat).view(bsz, num_frames, -1)
+
+        if self.cfg.use_attention_aggregation and self.video_aggregator is not None:
+            temporal_mask = None
+            if video_mask is not None:
+                temporal_mask = video_mask[:, None].expand(-1, num_frames) > 0
+            pooled, attn_weights = self.video_aggregator(frame_features, mask=temporal_mask)
+        else:
+            pooled = frame_features.mean(dim=1)
+            attn_weights = frame_features.new_full(
+                (bsz, num_frames),
+                fill_value=1.0 / max(num_frames, 1),
+            )
+
+        video_emb = self.video_proj(pooled)
+        video_emb = F.normalize(video_emb, p=2, dim=1)
+        if video_mask is not None:
+            video_emb = video_emb * video_mask.unsqueeze(1)
+        return video_emb, attn_weights
+
+    def _fuse_modalities(
+        self,
+        audio_emb: torch.Tensor | None,
+        video_emb: torch.Tensor | None,
+        video_mask: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if audio_emb is None and video_emb is None:
+            raise ValueError("audio/video 至少输入一个模态")
+
+        if audio_emb is None:
+            alpha = torch.zeros_like(video_emb)
+            return video_emb, alpha
+        if video_emb is None:
+            alpha = torch.ones_like(audio_emb)
+            return audio_emb, alpha
+
+        if self.cfg.use_adaptive_fusion and self.modal_fusion is not None:
+            fused, alpha = self.modal_fusion(audio_emb, video_emb)
+        else:
+            alpha = torch.full_like(audio_emb, 0.5)
+            fused = 0.5 * (audio_emb + video_emb)
+
+        if video_mask is not None:
+            valid = (video_mask > 0).float().unsqueeze(1)
+            fused = valid * fused + (1.0 - valid) * audio_emb
+            alpha = valid * alpha + (1.0 - valid) * torch.ones_like(alpha)
+        return fused, alpha
+
+    def forward(self, feat) -> Dict[str, torch.Tensor]:
+        audio_feat = None
+        video_feat = None
+        video_mask = None
+        if isinstance(feat, dict):
+            audio_feat = feat.get("audio")
+            video_feat = feat.get("video")
+            video_mask = feat.get("video_mask")
+        else:
+            audio_feat = feat
+
+        audio_emb = None
+        audio_aux: Dict[str, torch.Tensor] = {}
+        if self.use_audio_branch and audio_feat is not None:
+            audio_emb, audio_aux = self._encode_audio(audio_feat)
+
+        video_emb = None
+        frame_attn = None
+        if self.use_video_branch and video_feat is not None:
+            video_emb, frame_attn = self._encode_video(video_feat, video_mask=video_mask)
+
+        fused_embedding, fusion_alpha = self._fuse_modalities(
+            audio_emb,
+            video_emb,
+            video_mask=video_mask,
+        )
+        logits = self.classifier(fused_embedding)
+        cosine_logits = F.linear(
+            fused_embedding,
+            F.normalize(self.classifier.weight, p=2, dim=1),
+        )
+        probabilities = torch.softmax(logits, dim=1)
+
+        empty = fused_embedding.new_empty(0)
+        return {
+            "logits": logits,
+            "cosine_logits": cosine_logits,
+            "probabilities": probabilities,
+            "embedding": fused_embedding,
+            "audio_embedding": audio_emb if audio_emb is not None else empty,
+            "video_embedding": video_emb if video_emb is not None else empty,
+            "fusion_alpha": fusion_alpha,
+            "video_frame_attention": frame_attn if frame_attn is not None else empty,
+            "compressed_embedding": audio_aux.get("compressed_embedding", empty),
+            "scale_weights": audio_aux.get("scale_weights", empty),
+            "ce_gate": audio_aux.get("ce_gate", empty),
+            "classifier_se_gate": audio_aux.get("classifier_se_gate", empty),
+            "final_feature_map": audio_aux.get("final_feature_map", empty),
+            "multi_scale_features": audio_aux.get("multi_scale_features", empty),
         }
 
 

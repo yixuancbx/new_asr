@@ -34,6 +34,13 @@ class DataConfig:
     musan_prob: float = 0.5
     musan_snr_min_db: float = 5.0
     musan_snr_max_db: float = 20.0
+    video_enable: bool = False
+    video_roots: List[str] = field(default_factory=list)
+    video_extensions: List[str] = field(
+        default_factory=lambda: [".mp4", ".avi", ".mov", ".mkv"]
+    )
+    video_num_frames: int = 8
+    video_frame_size: int = 112
 
 
 @dataclass
@@ -67,6 +74,8 @@ class TrainingConfig:
     loss_margin: float = 0.2
     loss_scale: float = 30.0
     loss_easy_margin: bool = False
+    modality_drop_video_prob: float = 0.1
+    modality_drop_audio_prob: float = 0.1
     log_interval: int = 20
     save_every_epoch: bool = False
 

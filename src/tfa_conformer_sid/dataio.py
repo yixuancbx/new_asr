@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import random
 from collections import defaultdict
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ def _speaker_seed(base_seed: int, speaker_id: str) -> int:
 class SpeakerSample:
     wav_path: str
     speaker_id: str
+    video_path: str | None = None
 
 
 class AudioFeatureExtractor:
@@ -192,6 +194,118 @@ class AudioFeatureExtractor:
         return self._to_feature(wave)
 
 
+class VideoROIExtractor:
+    """
+    Lightweight ROI extractor for talking-face video.
+    Assumes dataset videos are roughly face-centered; uses center-crop + resize.
+    """
+
+    def __init__(self, data_cfg: DataConfig) -> None:
+        self.enable = bool(data_cfg.video_enable)
+        self.num_frames = max(1, int(data_cfg.video_num_frames))
+        self.frame_size = max(16, int(data_cfg.video_frame_size))
+        self._read_video = None
+        if self.enable:
+            try:
+                tvio = importlib.import_module("torchvision.io")
+                self._read_video = getattr(tvio, "read_video")
+            except Exception as exc:
+                raise ImportError(
+                    "启用视频分支需要 torchvision，请安装：pip install torchvision"
+                ) from exc
+
+    def _empty_roi(self) -> torch.Tensor:
+        return torch.zeros(self.num_frames, 3, self.frame_size, self.frame_size, dtype=torch.float32)
+
+    def _sample_frames(self, frames: torch.Tensor, training: bool) -> torch.Tensor:
+        total = int(frames.size(0))
+        if total <= 0:
+            return self._empty_roi()
+        if total >= self.num_frames:
+            if training:
+                max_start = total - self.num_frames
+                start = random.randint(0, max_start) if max_start > 0 else 0
+                idx = torch.arange(start, start + self.num_frames, device=frames.device)
+            else:
+                idx = (
+                    torch.linspace(0, total - 1, steps=self.num_frames, device=frames.device)
+                    .round()
+                    .long()
+                )
+            return frames.index_select(0, idx)
+
+        pad_num = self.num_frames - total
+        pad_frames = frames[-1:].repeat(pad_num, 1, 1, 1)
+        return torch.cat([frames, pad_frames], dim=0)
+
+    def _extract_center_roi(self, frames: torch.Tensor) -> torch.Tensor:
+        _, _, h, w = frames.shape
+        side = min(h, w)
+        top = (h - side) // 2
+        left = (w - side) // 2
+        roi = frames[:, :, top : top + side, left : left + side]
+        return F.interpolate(
+            roi,
+            size=(self.frame_size, self.frame_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+    def __call__(self, video_path: str | None, training: bool) -> Tuple[torch.Tensor, float]:
+        if not self.enable or not video_path:
+            return self._empty_roi(), 0.0
+        if self._read_video is None:
+            return self._empty_roi(), 0.0
+        try:
+            frames, _, _ = self._read_video(str(video_path), pts_unit="sec")
+        except Exception:
+            return self._empty_roi(), 0.0
+        if frames.ndim != 4 or frames.size(0) == 0:
+            return self._empty_roi(), 0.0
+
+        frames = frames.float().permute(0, 3, 1, 2) / 255.0  # [T, C, H, W]
+        frames = self._extract_center_roi(frames)
+        frames = self._sample_frames(frames, training=training)
+        return frames.contiguous(), 1.0
+
+
+def _scan_video_lookup(data_cfg: DataConfig) -> Tuple[Dict[Tuple[str, str], str], Dict[str, List[str]]]:
+    if not data_cfg.video_enable:
+        return {}, {}
+    video_extensions = _normalize_extensions(data_cfg.video_extensions)
+    if not video_extensions:
+        return {}, {}
+
+    speaker_level = int(data_cfg.speaker_level)
+    by_key: Dict[Tuple[str, str], str] = {}
+    by_speaker: Dict[str, List[str]] = defaultdict(list)
+
+    for root in data_cfg.video_roots:
+        root_path = Path(root)
+        if not root_path.exists():
+            continue
+        for video_path in root_path.rglob("*"):
+            if not video_path.is_file() or video_path.suffix.lower() not in video_extensions:
+                continue
+            try:
+                rel_parts = video_path.relative_to(root_path).parts
+            except ValueError:
+                continue
+            if len(rel_parts) <= speaker_level:
+                continue
+            speaker_id = rel_parts[-(speaker_level + 1)]
+            stem = video_path.stem
+            key = (speaker_id, stem)
+            path_str = str(video_path)
+            by_speaker[speaker_id].append(path_str)
+            if key not in by_key:
+                by_key[key] = path_str
+
+    for speaker_id in by_speaker:
+        by_speaker[speaker_id] = sorted(by_speaker[speaker_id])
+    return by_key, by_speaker
+
+
 def scan_speaker_samples(data_cfg: DataConfig) -> List[SpeakerSample]:
     extensions = _normalize_extensions(data_cfg.extensions)
     if not extensions:
@@ -225,6 +339,8 @@ def scan_speaker_samples(data_cfg: DataConfig) -> List[SpeakerSample]:
     if not samples_by_speaker:
         raise RuntimeError("未扫描到任何音频样本，请检查 data.roots / data.extensions 配置")
 
+    video_by_key, video_by_speaker = _scan_video_lookup(data_cfg)
+
     max_samples = int(data_cfg.max_samples_per_speaker)
     rng = random.Random(int(data_cfg.speaker_sample_seed))
     selected: List[SpeakerSample] = []
@@ -233,7 +349,23 @@ def scan_speaker_samples(data_cfg: DataConfig) -> List[SpeakerSample]:
         if max_samples > 0 and len(items) > max_samples:
             pick_idx = sorted(rng.sample(range(len(items)), k=max_samples))
             items = [items[i] for i in pick_idx]
-        selected.extend(items)
+        for sample in items:
+            stem = Path(sample.wav_path).stem
+            video_path = video_by_key.get((speaker_id, stem))
+            if video_path is None:
+                candidates = video_by_speaker.get(speaker_id, [])
+                if candidates:
+                    local_rng = random.Random(
+                        _speaker_seed(int(data_cfg.speaker_sample_seed), f"{speaker_id}:{stem}")
+                    )
+                    video_path = local_rng.choice(candidates)
+            selected.append(
+                SpeakerSample(
+                    wav_path=sample.wav_path,
+                    speaker_id=sample.speaker_id,
+                    video_path=video_path,
+                )
+            )
     return selected
 
 
@@ -304,12 +436,14 @@ class SpeakerFeatureDataset(Dataset):
         self,
         samples: Sequence[SpeakerSample],
         label_map: Dict[str, int],
-        extractor: AudioFeatureExtractor,
+        audio_extractor: AudioFeatureExtractor,
+        video_extractor: VideoROIExtractor | None,
         training: bool,
     ) -> None:
         self.samples = list(samples)
         self.label_map = label_map
-        self.extractor = extractor
+        self.audio_extractor = audio_extractor
+        self.video_extractor = video_extractor
         self.training = bool(training)
 
     def __len__(self) -> int:
@@ -317,15 +451,34 @@ class SpeakerFeatureDataset(Dataset):
 
     def __getitem__(self, index: int):
         sample = self.samples[index]
-        feat = self.extractor(sample.wav_path, training=self.training)
+        feat = self.audio_extractor(sample.wav_path, training=self.training)
+        item: Dict[str, torch.Tensor] = {"audio": feat}
+        if self.video_extractor is not None:
+            video_roi, video_mask = self.video_extractor(
+                sample.video_path,
+                training=self.training,
+            )
+            item["video"] = video_roi
+            item["video_mask"] = torch.tensor(video_mask, dtype=torch.float32)
         label = self.label_map[sample.speaker_id]
-        return feat, label
+        return item, label
 
 
-def speaker_batch_collate(batch) -> Tuple[torch.Tensor, torch.Tensor]:
+def speaker_batch_collate(batch):
     if not batch:
         return torch.empty(0), torch.empty(0, dtype=torch.long)
     feats, labels = zip(*batch)
+    first = feats[0]
+    if isinstance(first, dict):
+        out: Dict[str, torch.Tensor] = {}
+        out["audio"] = pad_sequence([item["audio"] for item in feats], batch_first=True)
+        if "video" in first:
+            out["video"] = torch.stack([item["video"] for item in feats], dim=0)
+        if "video_mask" in first:
+            out["video_mask"] = torch.stack([item["video_mask"] for item in feats], dim=0).view(-1)
+        label_tensor = torch.tensor(labels, dtype=torch.long)
+        return out, label_tensor
+
     feat_tensor = pad_sequence(feats, batch_first=True)
     label_tensor = torch.tensor(labels, dtype=torch.long)
     return feat_tensor, label_tensor

@@ -19,6 +19,7 @@ from tfa_conformer_sid.config import ProjectConfig, dump_yaml_config, load_yaml_
 from tfa_conformer_sid.dataio import (
     AudioFeatureExtractor,
     SpeakerFeatureDataset,
+    VideoROIExtractor,
     build_label_map,
     scan_speaker_samples,
     speaker_batch_collate,
@@ -72,18 +73,35 @@ def build_dataloaders(cfg: ProjectConfig) -> Tuple[Dict[str, DataLoader], Dict[s
     print("数据划分完成。", flush=True)
 
     print("正在初始化特征提取器...", flush=True)
-    extractor = AudioFeatureExtractor(data_cfg=cfg.data, feature_cfg=cfg.feature)
-    print("特征提取器初始化完成。", flush=True)
+    audio_extractor = AudioFeatureExtractor(data_cfg=cfg.data, feature_cfg=cfg.feature)
+    video_extractor = VideoROIExtractor(data_cfg=cfg.data)
+    print(
+        f"特征提取器初始化完成。video_enable={cfg.data.video_enable} "
+        f"video_frames={cfg.data.video_num_frames}",
+        flush=True,
+    )
 
     print("正在构建 Dataset 对象...", flush=True)
     train_ds = SpeakerFeatureDataset(
-        samples=train_samples, label_map=label_map, extractor=extractor, training=True
+        samples=train_samples,
+        label_map=label_map,
+        audio_extractor=audio_extractor,
+        video_extractor=video_extractor,
+        training=True,
     )
     val_ds = SpeakerFeatureDataset(
-        samples=val_samples, label_map=label_map, extractor=extractor, training=False
+        samples=val_samples,
+        label_map=label_map,
+        audio_extractor=audio_extractor,
+        video_extractor=video_extractor,
+        training=False,
     )
     test_ds = SpeakerFeatureDataset(
-        samples=test_samples, label_map=label_map, extractor=extractor, training=False
+        samples=test_samples,
+        label_map=label_map,
+        audio_extractor=audio_extractor,
+        video_extractor=video_extractor,
+        training=False,
     )
     print("Dataset 构建完成。", flush=True)
 
@@ -219,6 +237,12 @@ def main() -> None:
         dump_yaml_config(cfg, run_dir / "resolved_config.yaml")
 
     model = TFAMultiScaleConformerSpeakerNet(cfg.model).to(device)
+    print(
+        f"[Model] use_audio_branch={cfg.model.use_audio_branch} "
+        f"use_video_branch={cfg.model.use_video_branch} "
+        f"use_adaptive_fusion={cfg.model.use_adaptive_fusion} "
+        f"use_attention_aggregation={cfg.model.use_attention_aggregation}"
+    )
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=cfg.train.lr,

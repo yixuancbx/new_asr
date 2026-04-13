@@ -35,6 +35,13 @@ data:
   musan_prob: 0.5
   musan_snr_min_db: 5.0
   musan_snr_max_db: 20.0
+  # 视频多模态输入（说话人 ROI 视频）
+  video_enable: false
+  video_roots:
+    - "D:\\VPN\\video_roi"
+  video_extensions: [".mp4", ".avi", ".mov", ".mkv"]
+  video_num_frames: 8
+  video_frame_size: 112
 
 feature:
   # 论文设置：MFCC + 25ms 窗长 + 10ms 帧移 + n_fft=256
@@ -63,6 +70,13 @@ model:
   classifier_se_reduction: 8
   bottleneck_dim: 512
   embedding_dim: 1024
+  video_backbone_dim: 512
+  fusion_hidden_dim: 256
+  # 消融开关
+  use_audio_branch: true
+  use_video_branch: true
+  use_attention_aggregation: true
+  use_adaptive_fusion: true
   dropout: 0.1
 
 train:
@@ -87,6 +101,9 @@ train:
   loss_margin: 0.2
   loss_scale: 30.0
   loss_easy_margin: false
+  # 模态随机丢弃：训练时按概率将某一模态输入整分支置零
+  modality_drop_video_prob: 0.1
+  modality_drop_audio_prob: 0.1
   log_interval: 0
   save_every_epoch: false
 

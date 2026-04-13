@@ -5,8 +5,11 @@
 - 帧级特征编码器：`SE-Res2Block × 3` 堆叠
 - `TFA-Conformer` 模块堆叠与多尺度融合
 - 压缩激励时域均衡模块
+- 视频分支：`ResNet18` ROI 编码 + 注意力聚合
+- 自适应音视频融合（可切换为简单平均用于消融）
 - `Warmup + Cosine/Step` 学习率调度
 - MUSAN 噪声数据增强（训练阶段）
+- 模态随机丢弃（训练阶段随机置零音频/视频分支）
 - 说话人分类训练（ACC / Precision / Recall / F1）
 
 ## 目录结构
@@ -45,6 +48,7 @@ pip install -r requirements.txt
 data/TIMIT/<speaker_id>/*.wav
 data/ST-CMDS/<speaker_id>/*.wav
 data/musan/**/*.(wav|flac)   # 可选，用于噪声增强
+data/video_roi/<speaker_id>/*.mp4  # 可选，用于视频分支
 ```
 
 可在 `configs/paper_experiment.yaml` 中修改：
@@ -55,6 +59,9 @@ data/musan/**/*.(wav|flac)   # 可选，用于噪声增强
 - `data.max_samples_per_speaker`（每位说话人最多保留多少条音频，默认 6）
 - `data.speaker_sample_seed`（说话人内样本超限时的采样随机种子）
 - `data.musan_*`（MUSAN 增强开关、路径、SNR 范围、增强概率）
+- `data.video_*`（视频分支开关、路径、帧数、ROI 尺寸）
+- `train.modality_drop_*`（训练阶段音频/视频整分支随机置零概率）
+- `model.use_*`（音频/视频分支、注意力聚合、自适应融合的消融开关）
 
 ## 训练
 
