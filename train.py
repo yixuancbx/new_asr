@@ -211,6 +211,25 @@ def save_checkpoint(
     torch.save(state, str(path))
 
 
+def load_model_state_dict_flexible(
+    model: torch.nn.Module,
+    state_dict: Dict[str, torch.Tensor],
+    source: str,
+) -> None:
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    missing_keys = list(incompatible.missing_keys)
+    unexpected_keys = list(incompatible.unexpected_keys)
+    print(f"[Runtime] 从 {source} 加载模型参数（strict=False）")
+    if missing_keys:
+        print(
+            f"[Warn] 缺少参数 {len(missing_keys)} 个，示例: {missing_keys[:10]}"
+        )
+    if unexpected_keys:
+        print(
+            f"[Warn] 多余参数 {len(unexpected_keys)} 个，示例: {unexpected_keys[:10]}"
+        )
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config)
@@ -271,8 +290,18 @@ def main() -> None:
 
     if args.resume.strip():
         ckpt = torch.load(args.resume.strip(), map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        load_model_state_dict_flexible(
+            model=model,
+            state_dict=ckpt["model_state_dict"],
+            source=args.resume.strip(),
+        )
+        # 尝试加载优化器状态，如果架构改变导致大小不匹配，则跳过加载
+        try:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            print("[Runtime] 优化器状态加载成功")
+        except ValueError as e:
+            print(f"[Warn] 优化器状态加载失败（通常由于模型架构改变）: {e}")
+            print("[Runtime] 将为新模型初始化全新的优化器状态")
         scheduler_state = ckpt.get("scheduler_state_dict")
         if scheduler_state is not None:
             try:
@@ -322,8 +351,12 @@ def main() -> None:
             f"val_f1={val_result.f1:.4f}"
         )
 
-        if val_result.f1 > best_val_f1:
-            best_val_f1 = val_result.f1
+        # 如果当前是最高分，或者当前目录下还没有 best.pt 文件，就保存
+        is_best = val_result.f1 > best_val_f1
+        if is_best or not (run_dir / "best.pt").exists():
+            if is_best:
+                best_val_f1 = val_result.f1
+                print(f"[Best] 更新最优模型分数，val_f1={best_val_f1:.4f}")
             save_checkpoint(
                 path=run_dir / "best.pt",
                 epoch=epoch,
@@ -335,7 +368,6 @@ def main() -> None:
                 label_map=label_map,
                 best_val_f1=best_val_f1,
             )
-            print(f"[Best] 更新最优模型，val_f1={best_val_f1:.4f}")
 
         if cfg.train.save_every_epoch:
             save_checkpoint(
@@ -362,8 +394,17 @@ def main() -> None:
             best_val_f1=best_val_f1,
         )
 
-    best_ckpt = torch.load(run_dir / "best.pt", map_location=device)
-    model.load_state_dict(best_ckpt["model_state_dict"])
+    target_ckpt = run_dir / "best.pt"
+    if not target_ckpt.exists():
+        target_ckpt = run_dir / "last.pt"
+        print(f"[Warn] 未找到 best.pt，将使用最后一次模型 {target_ckpt} 进行测试")
+
+    best_ckpt = torch.load(target_ckpt, map_location=device)
+    load_model_state_dict_flexible(
+        model=model,
+        state_dict=best_ckpt["model_state_dict"],
+        source=str(target_ckpt),
+    )
     test_result = run_one_epoch(
         model=model,
         loader=loaders["test"],

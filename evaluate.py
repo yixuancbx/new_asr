@@ -26,6 +26,25 @@ from tfa_conformer_sid.engine import run_one_epoch
 from tfa_conformer_sid.models import TFAMultiScaleConformerSpeakerNet
 
 
+def load_model_state_dict_flexible(
+    model: torch.nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    source: str,
+) -> None:
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    missing_keys = list(incompatible.missing_keys)
+    unexpected_keys = list(incompatible.unexpected_keys)
+    print(f"[Runtime] 从 {source} 加载模型参数（strict=False）")
+    if missing_keys:
+        print(
+            f"[Warn] 缺少参数 {len(missing_keys)} 个，示例: {missing_keys[:10]}"
+        )
+    if unexpected_keys:
+        print(
+            f"[Warn] 多余参数 {len(unexpected_keys)} 个，示例: {unexpected_keys[:10]}"
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="评估 TFA-Conformer 说话人识别模型")
     parser.add_argument(
@@ -93,7 +112,11 @@ def main() -> None:
     )
 
     ckpt = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    load_model_state_dict_flexible(
+        model=model,
+        state_dict=ckpt["model_state_dict"],
+        source=args.checkpoint,
+    )
     result = run_one_epoch(
         model=model,
         loader=test_loader,
