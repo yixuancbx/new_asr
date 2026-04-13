@@ -16,7 +16,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from tfa_conformer_sid.config import ProjectConfig, dump_yaml_config, load_yaml_config
-from tfa_conformer_sid.data import (
+from tfa_conformer_sid.dataio import (
     AudioFeatureExtractor,
     SpeakerFeatureDataset,
     build_label_map,
@@ -123,6 +123,52 @@ def build_dataloaders(cfg: ProjectConfig) -> Tuple[Dict[str, DataLoader], Dict[s
     return loaders, label_map
 
 
+def build_scheduler(
+    cfg: ProjectConfig,
+    optimizer: torch.optim.Optimizer,
+    steps_per_epoch: int,
+) -> torch.optim.lr_scheduler._LRScheduler:
+    if steps_per_epoch <= 0:
+        raise ValueError("steps_per_epoch 必须大于 0")
+
+    scheduler_type = str(cfg.train.scheduler_type).strip().lower()
+    warmup_epochs = max(0, int(cfg.train.warmup_epochs))
+    warmup_steps = warmup_epochs * steps_per_epoch
+    total_steps = max(1, int(cfg.train.epochs) * steps_per_epoch)
+
+    if scheduler_type == "cosine":
+        decay_steps = max(1, total_steps - warmup_steps)
+        decay_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer=optimizer,
+            T_max=decay_steps,
+            eta_min=max(0.0, float(cfg.train.scheduler_min_lr)),
+        )
+    elif scheduler_type == "step":
+        decay_scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer=optimizer,
+            step_size=max(1, int(cfg.train.scheduler_step_size)),
+            gamma=float(cfg.train.scheduler_gamma),
+        )
+    else:
+        raise ValueError("train.scheduler_type 仅支持: cosine / step")
+
+    if warmup_steps <= 0:
+        return decay_scheduler
+
+    start_factor = min(max(float(cfg.train.warmup_start_factor), 1e-4), 1.0)
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer=optimizer,
+        start_factor=start_factor,
+        end_factor=1.0,
+        total_iters=warmup_steps,
+    )
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer=optimizer,
+        schedulers=[warmup_scheduler, decay_scheduler],
+        milestones=[warmup_steps],
+    )
+
+
 def save_checkpoint(
     path: Path,
     epoch: int,
@@ -178,10 +224,16 @@ def main() -> None:
         lr=cfg.train.lr,
         weight_decay=cfg.train.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer,
-        step_size=cfg.train.scheduler_step_size,
-        gamma=cfg.train.scheduler_gamma,
+    steps_per_epoch = max(1, len(loaders["train"]))
+    scheduler = build_scheduler(
+        cfg=cfg,
+        optimizer=optimizer,
+        steps_per_epoch=steps_per_epoch,
+    )
+    print(
+        f"[Train] scheduler={cfg.train.scheduler_type} "
+        f"warmup_epochs={cfg.train.warmup_epochs} "
+        f"steps_per_epoch={steps_per_epoch}"
     )
     scaler = (
         torch.cuda.amp.GradScaler(enabled=True)
@@ -197,7 +249,12 @@ def main() -> None:
         ckpt = torch.load(args.resume.strip(), map_location=device)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        scheduler_state = ckpt.get("scheduler_state_dict")
+        if scheduler_state is not None:
+            try:
+                scheduler.load_state_dict(scheduler_state)
+            except Exception as exc:
+                print(f"[Warn] 调度器状态恢复失败，使用当前配置重建调度器: {exc}")
         if scaler is not None and ckpt.get("scaler_state_dict") is not None:
             scaler.load_state_dict(ckpt["scaler_state_dict"])
         best_val_f1 = float(ckpt.get("best_val_f1", -1.0))

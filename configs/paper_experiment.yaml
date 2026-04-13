@@ -27,6 +27,14 @@ data:
   eval_batch_size: 4
   num_workers: 4
   pin_memory: true
+  # MUSAN 噪声增强（仅训练阶段生效）
+  musan_enable: true
+  musan_roots:
+    - "D:\\VPN\\musan"
+  musan_extensions: [".wav", ".flac"]
+  musan_prob: 0.5
+  musan_snr_min_db: 5.0
+  musan_snr_max_db: 20.0
 
 feature:
   # 论文设置：MFCC + 25ms 窗长 + 10ms 帧移 + n_fft=256
@@ -59,7 +67,14 @@ train:
   epochs: 50
   lr: 0.0002
   weight_decay: 0.0001
-  # 近似论文“每 650 step 衰减”的设置
+  # 调度器类型: cosine | step
+  scheduler_type: "cosine"
+  # 前 5 个 epoch 进行线性 warmup
+  warmup_epochs: 5
+  warmup_start_factor: 0.1
+  # cosine 调度下的最小学习率
+  scheduler_min_lr: 0.000001
+  # step 调度参数（当 scheduler_type=step 时生效）
   scheduler_step_size: 650
   scheduler_gamma: 0.97
   grad_clip: 5.0

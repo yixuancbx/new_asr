@@ -28,6 +28,12 @@ class DataConfig:
     eval_batch_size: int = 64
     num_workers: int = 4
     pin_memory: bool = True
+    musan_enable: bool = False
+    musan_roots: List[str] = field(default_factory=list)
+    musan_extensions: List[str] = field(default_factory=lambda: [".wav", ".flac"])
+    musan_prob: float = 0.5
+    musan_snr_min_db: float = 5.0
+    musan_snr_max_db: float = 20.0
 
 
 @dataclass
@@ -48,6 +54,10 @@ class TrainingConfig:
     epochs: int = 50
     lr: float = 5e-4
     weight_decay: float = 1e-4
+    scheduler_type: str = "cosine"  # cosine | step
+    warmup_epochs: int = 5
+    warmup_start_factor: float = 0.1
+    scheduler_min_lr: float = 1e-6
     scheduler_step_size: int = 650
     scheduler_gamma: float = 0.97
     grad_clip: float = 5.0

@@ -13,7 +13,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from tfa_conformer_sid.config import load_yaml_config
-from tfa_conformer_sid.data import (
+from tfa_conformer_sid.dataio import (
     AudioFeatureExtractor,
     SpeakerFeatureDataset,
     build_label_map,
