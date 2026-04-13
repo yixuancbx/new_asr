@@ -122,15 +122,17 @@ class SERes2Block(nn.Module):
         channels: int,
         scale: int = 6,
         reduction: int = 8,
+        half_step: float = 0.5,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.res2 = Res2Conv2d(channels=channels, scale=scale, dropout=dropout)
         self.se = SELayer2d(channels=channels, reduction=reduction)
+        self.half_step = half_step
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(x + self.se(self.res2(x)))
+        return self.act(x + self.half_step * self.se(self.res2(x)))
 
 
 class HybridFeatureEncoder(nn.Module):
