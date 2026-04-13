@@ -135,9 +135,8 @@ class SERes2Block(nn.Module):
 
 class HybridFeatureEncoder(nn.Module):
     """
-    Hybrid feature encoder:
-    Conv-BN-ReLU -> SF-Res2Block -> SE-Res2Block -> SF-Res2Block
-    with dense-like residual bridges.
+    Frame-level encoder:
+    Conv-BN-ReLU -> SE-Res2Block -> SE-Res2Block -> SE-Res2Block.
     """
 
     def __init__(
@@ -153,16 +152,16 @@ class HybridFeatureEncoder(nn.Module):
             nn.BatchNorm2d(channels),
             nn.ReLU(inplace=True),
         )
-        self.sf1 = SFRes2Block(channels=channels, scale=scale, dropout=dropout)
-        self.se = SERes2Block(channels=channels, scale=scale, dropout=dropout)
-        self.sf2 = SFRes2Block(channels=channels, scale=scale, dropout=dropout)
+        self.se1 = SERes2Block(channels=channels, scale=scale, dropout=dropout)
+        self.se2 = SERes2Block(channels=channels, scale=scale, dropout=dropout)
+        self.se3 = SERes2Block(channels=channels, scale=scale, dropout=dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x0 = self.stem(x)
-        x1 = self.sf1(x0)
-        x2 = self.se(x1 + x0)
-        x3 = self.sf2(x2 + x1)
-        return x3
+        x = self.stem(x)
+        x = self.se1(x)
+        x = self.se2(x)
+        x = self.se3(x)
+        return x
 
 
 class DomainSeparableAttention1d(nn.Module):
@@ -324,8 +323,9 @@ class PointDepthwiseSeparableConv2d(nn.Module):
 
 class TFAConformerBlock(nn.Module):
     """
-    TFA-Conformer block:
-    0.5*FFN -> MHSA -> PW-DW Conv -> TF-attention -> 0.5*FFN.
+    Serial flow block:
+    MHSA(global) -> TF-attention(0.5 residual) ->
+    PW-DW Conv(local, 0.5 residual) -> single FFN.
     """
 
     def __init__(
@@ -338,34 +338,31 @@ class TFAConformerBlock(nn.Module):
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
-        self.norm_ffn1 = LayerNorm2d(channels)
         self.norm_attn = LayerNorm2d(channels)
-        self.norm_conv = LayerNorm2d(channels)
         self.norm_tfa = LayerNorm2d(channels)
-        self.norm_ffn2 = LayerNorm2d(channels)
+        self.norm_conv = LayerNorm2d(channels)
+        self.norm_ffn = LayerNorm2d(channels)
         self.out_norm = LayerNorm2d(channels)
 
-        self.ffn1 = FFN2d(channels=channels, mult=ff_mult, dropout=dropout)
         self.attn = TemporalSelfAttention(channels=channels, num_heads=num_heads, dropout=dropout)
+        self.tfa_pool = TimeFrequencyAttentionPooling(
+            branch_channels=32,
+            kernel_size=7,
+            dilation=3,
+        )
         self.conv = PointDepthwiseSeparableConv2d(
             channels=channels,
             kernel_t=conv_kernel_t,
             kernel_f=conv_kernel_f,
             dropout=dropout,
         )
-        self.tfa_pool = TimeFrequencyAttentionPooling(
-            branch_channels=32,
-            kernel_size=7,
-            dilation=3,
-        )
-        self.ffn2 = FFN2d(channels=channels, mult=ff_mult, dropout=dropout)
+        self.ffn = FFN2d(channels=channels, mult=ff_mult, dropout=dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + 0.5 * self.ffn1(self.norm_ffn1(x))
         x = x + self.attn(self.norm_attn(x))
-        x = x + self.conv(self.norm_conv(x))
-        x = x + self.tfa_pool(self.norm_tfa(x))[0]
-        x = x + 0.5 * self.ffn2(self.norm_ffn2(x))
+        x = x + 0.5 * self.tfa_pool(self.norm_tfa(x))[0]
+        x = x + 0.5 * self.conv(self.norm_conv(x))
+        x = x + self.ffn(self.norm_ffn(x))
         return self.out_norm(x)
 
 
@@ -432,6 +429,20 @@ class CompressionExcitationBalance(nn.Module):
         return x * gate[:, :, None, None], gate
 
 
+class ClassifierSEBlock(nn.Module):
+    """Extra SE block before classifier head."""
+
+    def __init__(self, channels: int, reduction: int = 8) -> None:
+        super().__init__()
+        hidden = max(8, channels // reduction)
+        self.fc1 = nn.Linear(channels, hidden)
+        self.fc2 = nn.Linear(hidden, channels)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        gate = torch.sigmoid(self.fc2(F.relu(self.fc1(x.mean(dim=(2, 3))), inplace=True)))
+        return x * gate[:, :, None, None], gate
+
+
 @dataclass
 class ModelConfig:
     num_speakers: int = 855
@@ -444,13 +455,16 @@ class ModelConfig:
     conv_kernel_t: int = 17
     conv_kernel_f: int = 3
     ce_reduction: int = 8
-    embedding_dim: int = 256
+    classifier_se_reduction: int = 8
+    bottleneck_dim: int = 512
+    embedding_dim: int = 1024
     dropout: float = 0.1
 
 
 class TFAMultiScaleConformerSpeakerNet(nn.Module):
     """
-    Multi-scale short-utterance speaker identification model based on TFA-Conformer.
+    Multi-scale short-utterance speaker identification model with
+    SE-Res2 frame encoder + serial-flow TFA blocks + SE-enhanced classifier head.
     """
 
     def __init__(self, cfg: ModelConfig) -> None:
@@ -475,13 +489,17 @@ class TFAMultiScaleConformerSpeakerNet(nn.Module):
             channels=cfg.feature_channels,
             reduction=cfg.ce_reduction,
         )
-        self.emb_proj = nn.LazyLinear(cfg.embedding_dim)
-        self.emb_bn = nn.BatchNorm1d(cfg.embedding_dim)
+        self.classifier_se = ClassifierSEBlock(
+            channels=cfg.feature_channels,
+            reduction=cfg.classifier_se_reduction,
+        )
+        self.bottleneck_proj = nn.Linear(cfg.feature_channels, cfg.bottleneck_dim)
+        self.emb_proj = nn.Linear(cfg.bottleneck_dim, cfg.embedding_dim)
         self.classifier = nn.Linear(cfg.embedding_dim, cfg.num_speakers)
 
     @staticmethod
     def _stats_pool(x: torch.Tensor) -> torch.Tensor:
-        return x.mean(dim=2)  # [B, C, F]
+        return x.mean(dim=(2, 3))  # [B, C]
 
     def forward(self, feat: torch.Tensor) -> Dict[str, torch.Tensor]:
         if feat.dim() == 3:
@@ -499,20 +517,29 @@ class TFAMultiScaleConformerSpeakerNet(nn.Module):
         x = self.feature_encoder(x)
         x, scales, scale_weights = self.tfa_encoder(x)
         x, ce_gate = self.ce_balance(x)
+        x, cls_se_gate = self.classifier_se(x)
 
-        pooled = self._stats_pool(x).flatten(start_dim=1)
-        embedding = self.emb_proj(pooled)
-        embedding = self.emb_bn(embedding)
-        embedding = F.normalize(embedding, p=2, dim=1)
-        logits = self.classifier(embedding)
-        cosine_logits = F.linear(embedding, F.normalize(self.classifier.weight, p=2, dim=1))
+        pooled = self._stats_pool(x)
+        compressed = self.bottleneck_proj(pooled)
+        compressed = F.normalize(compressed, p=2, dim=1)
+        embedding = self.emb_proj(compressed)
+        embedding_norm = F.normalize(embedding, p=2, dim=1)
+        logits = self.classifier(embedding_norm)
+        cosine_logits = F.linear(
+            embedding_norm,
+            F.normalize(self.classifier.weight, p=2, dim=1),
+        )
+        probabilities = torch.softmax(logits, dim=1)
 
         return {
             "logits": logits,
             "cosine_logits": cosine_logits,
-            "embedding": embedding,
+            "probabilities": probabilities,
+            "embedding": embedding_norm,
+            "compressed_embedding": compressed,
             "scale_weights": scale_weights,
             "ce_gate": ce_gate,
+            "classifier_se_gate": cls_se_gate,
             "final_feature_map": x,
             "multi_scale_features": torch.stack(scales, dim=1),
         }

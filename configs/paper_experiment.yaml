@@ -15,7 +15,7 @@ data:
   # speaker_level=1 表示说话人 ID 为音频文件的父目录名
   speaker_level: 1
   # 每位说话人最多使用的音频数量（<=0 表示不限制）
-  max_samples_per_speaker: 6
+  max_samples_per_speaker: 60
   # 说话人内样本超限时的随机采样种子
   speaker_sample_seed: 42
   sample_rate: 16000
@@ -60,6 +60,8 @@ model:
   conv_kernel_t: 17
   conv_kernel_f: 3
   ce_reduction: 8
+  classifier_se_reduction: 8
+  bottleneck_dim: 512
   embedding_dim: 1024
   dropout: 0.1
 

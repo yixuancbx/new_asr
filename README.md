@@ -2,7 +2,7 @@
 
 本项目实现了论文图示对应的模型与训练流程：
 
-- 混合特征编码器：`SF-Res2Block + SE-Res2Block + SF-Res2Block`
+- 帧级特征编码器：`SE-Res2Block × 3` 堆叠
 - `TFA-Conformer` 模块堆叠与多尺度融合
 - 压缩激励时域均衡模块
 - `Warmup + Cosine/Step` 学习率调度
