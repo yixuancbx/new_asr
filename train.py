@@ -187,6 +187,41 @@ def build_scheduler(
     )
 
 
+def build_optimizer(
+    cfg: ProjectConfig,
+    model: torch.nn.Module,
+) -> torch.optim.Optimizer:
+    return torch.optim.Adam(
+        model.parameters(),
+        lr=cfg.train.lr,
+        weight_decay=cfg.train.weight_decay,
+    )
+
+
+def set_audio_branch_trainable(
+    model: torch.nn.Module,
+    trainable: bool,
+) -> int:
+    """Toggle requires_grad for all audio-branch modules."""
+    audio_module_names = (
+        "feature_encoder",
+        "tfa_encoder",
+        "ce_balance",
+        "classifier_se",
+        "bottleneck_proj",
+        "emb_proj",
+    )
+    affected_tensors = 0
+    for module_name in audio_module_names:
+        module = getattr(model, module_name, None)
+        if module is None:
+            continue
+        for param in module.parameters():
+            param.requires_grad = trainable
+            affected_tensors += 1
+    return affected_tensors
+
+
 def save_checkpoint(
     path: Path,
     epoch: int,
@@ -262,11 +297,7 @@ def main() -> None:
         f"use_adaptive_fusion={cfg.model.use_adaptive_fusion} "
         f"use_attention_aggregation={cfg.model.use_attention_aggregation}"
     )
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=cfg.train.lr,
-        weight_decay=cfg.train.weight_decay,
-    )
+    optimizer = build_optimizer(cfg=cfg, model=model)
     steps_per_epoch = max(1, len(loaders["train"]))
     scheduler = build_scheduler(
         cfg=cfg,
@@ -287,34 +318,89 @@ def main() -> None:
     history = []
     best_val_f1 = -1.0
     start_epoch = 1
+    stagewise_multimodal_finetune = False
+    freeze_audio_epochs = 15
 
     if args.resume.strip():
-        ckpt = torch.load(args.resume.strip(), map_location=device)
+        resume_path = args.resume.strip()
+        ckpt = torch.load(resume_path, map_location=device)
         load_model_state_dict_flexible(
             model=model,
             state_dict=ckpt["model_state_dict"],
-            source=args.resume.strip(),
+            source=resume_path,
         )
-        # 尝试加载优化器状态，如果架构改变导致大小不匹配，则跳过加载
+        optimizer_resume_ok = False
+        optimizer_state = ckpt.get("optimizer_state_dict")
         try:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            print("[Runtime] 优化器状态加载成功")
-        except ValueError as e:
-            print(f"[Warn] 优化器状态加载失败（通常由于模型架构改变）: {e}")
-            print("[Runtime] 将为新模型初始化全新的优化器状态")
-        scheduler_state = ckpt.get("scheduler_state_dict")
-        if scheduler_state is not None:
-            try:
-                scheduler.load_state_dict(scheduler_state)
-            except Exception as exc:
-                print(f"[Warn] 调度器状态恢复失败，使用当前配置重建调度器: {exc}")
-        if scaler is not None and ckpt.get("scaler_state_dict") is not None:
-            scaler.load_state_dict(ckpt["scaler_state_dict"])
-        best_val_f1 = float(ckpt.get("best_val_f1", -1.0))
-        start_epoch = int(ckpt["epoch"]) + 1
-        print(f"[Runtime] 从 checkpoint 恢复训练: {args.resume.strip()}, start_epoch={start_epoch}")
+            if optimizer_state is None:
+                raise KeyError("checkpoint 中缺少 optimizer_state_dict")
+            optimizer.load_state_dict(optimizer_state)
+            optimizer_resume_ok = True
+            print("[Runtime] 优化器状态加载成功，将按中断点继续训练")
+        except Exception as exc:
+            print(f"[Warn] 优化器状态加载失败（通常由跨架构微调触发）: {exc}")
+            print("[Runtime] 判定为跨架构热启动：重置优化器/调度器，并从 epoch=1 开始")
+            optimizer = build_optimizer(cfg=cfg, model=model)
+            scheduler = build_scheduler(
+                cfg=cfg,
+                optimizer=optimizer,
+                steps_per_epoch=steps_per_epoch,
+            )
+            scaler = (
+                torch.cuda.amp.GradScaler(enabled=True)
+                if (cfg.train.amp and device.type == "cuda")
+                else None
+            )
+
+        if optimizer_resume_ok:
+            scheduler_state = ckpt.get("scheduler_state_dict")
+            if scheduler_state is not None:
+                try:
+                    scheduler.load_state_dict(scheduler_state)
+                except Exception as exc:
+                    print(f"[Warn] 调度器状态恢复失败，使用当前配置重建调度器: {exc}")
+            if scaler is not None and ckpt.get("scaler_state_dict") is not None:
+                scaler.load_state_dict(ckpt["scaler_state_dict"])
+            best_val_f1 = float(ckpt.get("best_val_f1", -1.0))
+            start_epoch = int(ckpt["epoch"]) + 1
+            print(f"[Runtime] 从 checkpoint 恢复训练: {resume_path}, start_epoch={start_epoch}")
+        else:
+            start_epoch = 1
+            best_val_f1 = -1.0
+            stagewise_multimodal_finetune = bool(
+                cfg.model.use_audio_branch and cfg.model.use_video_branch
+            )
+            print(
+                "[Runtime] 已丢弃旧的 epoch 记录：从 Epoch 1 + 初始学习率启动新的微调流程"
+            )
+            if stagewise_multimodal_finetune:
+                print(
+                    f"[Runtime] 阶段化微调策略启用：Epoch 1-{freeze_audio_epochs} 冻结音频分支，"
+                    "Epoch 16 起联合微调全部参数"
+                )
+
+    audio_branch_frozen: bool | None = None
 
     for epoch in range(start_epoch, cfg.train.epochs + 1):
+        if stagewise_multimodal_finetune:
+            freeze_audio = epoch <= freeze_audio_epochs
+            if audio_branch_frozen is None or audio_branch_frozen != freeze_audio:
+                affected = set_audio_branch_trainable(
+                    model=model,
+                    trainable=not freeze_audio,
+                )
+                audio_branch_frozen = freeze_audio
+                if freeze_audio:
+                    print(
+                        f"[Train] Epoch {epoch}: 冻结音频分支（{affected} 个参数张量），"
+                        "仅训练视频/融合相关模块"
+                    )
+                else:
+                    print(
+                        f"[Train] Epoch {epoch}: 解冻音频分支（{affected} 个参数张量），"
+                        "开始全参数联合微调"
+                    )
+
         train_result = run_one_epoch(
             model=model,
             loader=loaders["train"],
