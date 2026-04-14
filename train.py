@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +29,15 @@ from tfa_conformer_sid.dataio import (
 from tfa_conformer_sid.engine import run_one_epoch
 from tfa_conformer_sid.models import TFAMultiScaleConformerSpeakerNet
 from tfa_conformer_sid.utils import seed_everything
+
+AUDIO_BRANCH_MODULE_NAMES = (
+    "feature_encoder",
+    "tfa_encoder",
+    "ce_balance",
+    "classifier_se",
+    "bottleneck_proj",
+    "emb_proj",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -191,11 +201,67 @@ def build_optimizer(
     cfg: ProjectConfig,
     model: torch.nn.Module,
 ) -> torch.optim.Optimizer:
+    base_lr = float(cfg.train.lr)
+    if base_lr <= 0:
+        raise ValueError("train.lr 必须大于 0")
+
+    audio_lr = (
+        float(cfg.train.audio_branch_lr)
+        if float(cfg.train.audio_branch_lr) > 0
+        else base_lr * float(cfg.train.audio_branch_lr_scale)
+    )
+    if audio_lr <= 0:
+        raise ValueError("audio 分支学习率必须大于 0")
+    if audio_lr >= base_lr:
+        print(
+            f"[Warn] audio 分支学习率({audio_lr:.6g}) >= 主学习率({base_lr:.6g})，"
+            "建议减小 audio 学习率以稳定微调。"
+        )
+
+    audio_prefixes = tuple(f"{name}." for name in AUDIO_BRANCH_MODULE_NAMES)
+    audio_params = []
+    non_audio_params = []
+    for name, param in model.named_parameters():
+        if name.startswith(audio_prefixes):
+            audio_params.append(param)
+        else:
+            non_audio_params.append(param)
+
+    param_groups = []
+    if non_audio_params:
+        param_groups.append(
+            {
+                "params": non_audio_params,
+                "lr": base_lr,
+                "group_name": "non_audio",
+            }
+        )
+    if audio_params:
+        param_groups.append(
+            {
+                "params": audio_params,
+                "lr": audio_lr,
+                "group_name": "audio_branch",
+            }
+        )
+    if not param_groups:
+        raise RuntimeError("未找到可训练参数，无法构建优化器")
+
     return torch.optim.Adam(
-        model.parameters(),
-        lr=cfg.train.lr,
+        param_groups,
+        lr=base_lr,
         weight_decay=cfg.train.weight_decay,
     )
+
+
+def log_optimizer_groups(optimizer: torch.optim.Optimizer) -> None:
+    details = []
+    for idx, group in enumerate(optimizer.param_groups):
+        group_name = str(group.get("group_name", f"group_{idx}"))
+        details.append(
+            f"{group_name}:lr={float(group['lr']):.6g},tensors={len(group['params'])}"
+        )
+    print("[Train] optimizer_groups => " + " | ".join(details))
 
 
 def set_audio_branch_trainable(
@@ -203,16 +269,8 @@ def set_audio_branch_trainable(
     trainable: bool,
 ) -> int:
     """Toggle requires_grad for all audio-branch modules."""
-    audio_module_names = (
-        "feature_encoder",
-        "tfa_encoder",
-        "ce_balance",
-        "classifier_se",
-        "bottleneck_proj",
-        "emb_proj",
-    )
     affected_tensors = 0
-    for module_name in audio_module_names:
+    for module_name in AUDIO_BRANCH_MODULE_NAMES:
         module = getattr(model, module_name, None)
         if module is None:
             continue
@@ -298,7 +356,9 @@ def main() -> None:
         f"use_attention_aggregation={cfg.model.use_attention_aggregation}"
     )
     optimizer = build_optimizer(cfg=cfg, model=model)
-    steps_per_epoch = max(1, len(loaders["train"]))
+    log_optimizer_groups(optimizer)
+    grad_accum_steps = max(1, int(cfg.train.grad_accum_steps))
+    steps_per_epoch = max(1, math.ceil(len(loaders["train"]) / grad_accum_steps))
     scheduler = build_scheduler(
         cfg=cfg,
         optimizer=optimizer,
@@ -307,7 +367,8 @@ def main() -> None:
     print(
         f"[Train] scheduler={cfg.train.scheduler_type} "
         f"warmup_epochs={cfg.train.warmup_epochs} "
-        f"steps_per_epoch={steps_per_epoch}"
+        f"steps_per_epoch={steps_per_epoch} "
+        f"grad_accum_steps={grad_accum_steps}"
     )
     scaler = (
         torch.cuda.amp.GradScaler(enabled=True)
@@ -341,6 +402,7 @@ def main() -> None:
             print(f"[Warn] 优化器状态加载失败（通常由跨架构微调触发）: {exc}")
             print("[Runtime] 判定为跨架构热启动：重置优化器/调度器，并从 epoch=1 开始")
             optimizer = build_optimizer(cfg=cfg, model=model)
+            log_optimizer_groups(optimizer)
             scheduler = build_scheduler(
                 cfg=cfg,
                 optimizer=optimizer,

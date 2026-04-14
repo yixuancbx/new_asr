@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -482,17 +483,30 @@ class VideoAttentionAggregator(nn.Module):
 class AdaptiveModalFusion(nn.Module):
     """Adaptive fusion gate between audio/video embeddings."""
 
-    def __init__(self, emb_dim: int, hidden_dim: int = 256) -> None:
+    def __init__(
+        self,
+        emb_dim: int,
+        hidden_dim: int = 256,
+        audio_prior: float = 0.8,
+    ) -> None:
         super().__init__()
-        self.gate = nn.Sequential(
+        if not (0.0 < audio_prior < 1.0):
+            raise ValueError("audio_prior 必须在 (0, 1) 区间内")
+
+        self.gate_feature = nn.Sequential(
             nn.Linear(emb_dim * 2, hidden_dim),
             nn.SiLU(inplace=True),
-            nn.Linear(hidden_dim, emb_dim),
-            nn.Sigmoid(),
         )
+        self.gate_proj = nn.Linear(hidden_dim, emb_dim)
+
+        # 让 alpha 在训练初期更偏向音频分支，减少噪声视频对融合结果的扰动。
+        safe_prior = min(max(float(audio_prior), 1e-4), 1.0 - 1e-4)
+        prior_bias = math.log(safe_prior / (1.0 - safe_prior))
+        nn.init.constant_(self.gate_proj.bias, prior_bias)
 
     def forward(self, audio_emb: torch.Tensor, video_emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        alpha = self.gate(torch.cat([audio_emb, video_emb], dim=1))
+        hidden = self.gate_feature(torch.cat([audio_emb, video_emb], dim=1))
+        alpha = torch.sigmoid(self.gate_proj(hidden))
         fused = alpha * audio_emb + (1.0 - alpha) * video_emb
         return fused, alpha
 
@@ -514,6 +528,7 @@ class ModelConfig:
     embedding_dim: int = 1024
     video_backbone_dim: int = 512
     fusion_hidden_dim: int = 256
+    fusion_audio_prior: float = 0.8
     use_audio_branch: bool = True
     use_video_branch: bool = True
     use_attention_aggregation: bool = True
@@ -586,6 +601,7 @@ class TFAMultiScaleConformerSpeakerNet(nn.Module):
             self.modal_fusion = AdaptiveModalFusion(
                 emb_dim=cfg.embedding_dim,
                 hidden_dim=cfg.fusion_hidden_dim,
+                audio_prior=cfg.fusion_audio_prior,
             )
         else:
             self.modal_fusion = None

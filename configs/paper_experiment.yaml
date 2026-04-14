@@ -72,6 +72,8 @@ model:
   embedding_dim: 1024
   video_backbone_dim: 512
   fusion_hidden_dim: 256
+  # 初始时更信任音频，减少噪声视频对融合门控的干扰
+  fusion_audio_prior: 0.8
   # 消融开关
   use_audio_branch: true
   use_video_branch: true
@@ -82,6 +84,9 @@ model:
 train:
   epochs: 50
   lr: 0.0002
+  # 音频分支是预训练模块，解冻后使用更小学习率进行微调
+  audio_branch_lr: 0.00004
+  audio_branch_lr_scale: 0.2
   weight_decay: 0.0001
   # 调度器类型: cosine | step
   scheduler_type: "cosine"
@@ -93,6 +98,8 @@ train:
   # step 调度参数（当 scheduler_type=step 时生效）
   scheduler_step_size: 650
   scheduler_gamma: 0.97
+  # 小 batch 下使用梯度累加，等效放大 batch size
+  grad_accum_steps: 4
   grad_clip: 5.0
   amp: true
   label_smoothing: 0.0

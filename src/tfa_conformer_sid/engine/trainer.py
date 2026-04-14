@@ -168,8 +168,13 @@ def run_one_epoch(
     loss_type = _resolve_loss_type(train_cfg)
 
     use_amp = bool(train_cfg.amp and device.type == "cuda")
+    grad_accum_steps = max(1, int(train_cfg.grad_accum_steps))
+    if train_mode and int(train_cfg.grad_accum_steps) < 1:
+        raise ValueError("train.grad_accum_steps 必须 >= 1")
+
     if train_mode:
         model.train()
+        optimizer.zero_grad(set_to_none=True)
     else:
         model.eval()
 
@@ -179,6 +184,8 @@ def run_one_epoch(
     all_pred = []
 
     context = torch.enable_grad if train_mode else torch.no_grad
+    total_steps = len(loader) if hasattr(loader, "__len__") else None
+    optimizer_steps = 0
     iter_loader = _iter_with_progress(
         loader, desc=f"{'Train' if train_mode else 'Eval'} Epoch {epoch_idx}"
     )
@@ -199,28 +206,39 @@ def run_one_epoch(
                 )
 
             if train_mode:
-                optimizer.zero_grad(set_to_none=True)
-                if scaler is not None and use_amp:
-                    scaler.scale(loss).backward()
-                    if train_cfg.grad_clip > 0:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    if train_cfg.grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
-                    optimizer.step()
+                loss_to_backward = loss / grad_accum_steps
+                should_step = step % grad_accum_steps == 0
+                if total_steps is not None and step == total_steps:
+                    should_step = True
 
-                if scheduler is not None:
+                if scaler is not None and use_amp:
+                    scaler.scale(loss_to_backward).backward()
+                    if should_step:
+                        if train_cfg.grad_clip > 0:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad(set_to_none=True)
+                        optimizer_steps += 1
+                else:
+                    loss_to_backward.backward()
+                    if should_step:
+                        if train_cfg.grad_clip > 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        optimizer_steps += 1
+
+                if scheduler is not None and should_step:
                     scheduler.step()
 
                 if train_cfg.log_interval > 0 and step % train_cfg.log_interval == 0:
                     lr_now = optimizer.param_groups[0]["lr"]
                     print(
                         f"[Train] epoch={epoch_idx} step={step} "
-                        f"loss={loss.item():.4f} lr={lr_now:.6g}"
+                        f"loss={loss.item():.4f} lr={lr_now:.6g} "
+                        f"accum={grad_accum_steps} opt_step={optimizer_steps}"
                     )
 
             preds = metric_logits.argmax(dim=1)

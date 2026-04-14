@@ -60,6 +60,8 @@ class FeatureConfig:
 class TrainingConfig:
     epochs: int = 50
     lr: float = 5e-4
+    audio_branch_lr: float = 0.0
+    audio_branch_lr_scale: float = 0.1
     weight_decay: float = 1e-4
     scheduler_type: str = "cosine"  # cosine | step
     warmup_epochs: int = 5
@@ -67,6 +69,7 @@ class TrainingConfig:
     scheduler_min_lr: float = 1e-6
     scheduler_step_size: int = 650
     scheduler_gamma: float = 0.97
+    grad_accum_steps: int = 1
     grad_clip: float = 5.0
     amp: bool = True
     label_smoothing: float = 0.0
