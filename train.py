@@ -27,10 +27,11 @@ from tfa_conformer_sid.dataio import (
     split_samples_per_speaker,
 )
 from tfa_conformer_sid.engine import run_one_epoch
-from tfa_conformer_sid.models import TFAMultiScaleConformerSpeakerNet
+from tfa_conformer_sid.models import build_speaker_model, count_trainable_parameters
 from tfa_conformer_sid.utils import seed_everything
 
 AUDIO_BRANCH_MODULE_NAMES = (
+    "audio_backbone",
     "feature_encoder",
     "tfa_encoder",
     "ce_balance",
@@ -348,12 +349,32 @@ def main() -> None:
         cfg.model.num_speakers = num_classes
         dump_yaml_config(cfg, run_dir / "resolved_config.yaml")
 
-    model = TFAMultiScaleConformerSpeakerNet(cfg.model).to(device)
+    model = build_speaker_model(cfg.model).to(device)
+    model_backbone = str(getattr(model, "backbone_type", cfg.model.backbone_type))
+    model_params = count_trainable_parameters(model)
+    model_use_audio_branch = bool(getattr(model, "use_audio_branch", True))
+    model_use_video_branch = bool(getattr(model, "use_video_branch", False))
+    param_match_info = getattr(model, "param_match_info", None)
     print(
-        f"[Model] use_audio_branch={cfg.model.use_audio_branch} "
-        f"use_video_branch={cfg.model.use_video_branch} "
-        f"use_adaptive_fusion={cfg.model.use_adaptive_fusion} "
-        f"use_attention_aggregation={cfg.model.use_attention_aggregation}"
+        f"[Model] backbone_type={model_backbone} "
+        f"params={model_params} ({model_params / 1_000_000:.2f}M)"
+    )
+    if isinstance(param_match_info, dict) and bool(param_match_info.get("enabled", False)):
+        print(
+            "[Model] baseline_param_match "
+            f"target={param_match_info.get('target_params')} "
+            f"selected={param_match_info.get('selected_params')} "
+            f"diff={param_match_info.get('abs_diff')} "
+            f"width={param_match_info.get('selected_width')}"
+        )
+    print(
+        f"[Model] use_audio_branch={model_use_audio_branch} "
+        f"use_video_branch={model_use_video_branch} "
+        f"use_adaptive_fusion={bool(getattr(model, 'use_adaptive_fusion', False))} "
+        f"use_attention_aggregation={bool(getattr(model, 'use_attention_aggregation', False))} "
+        f"use_conformer_conv={bool(getattr(model, 'use_conformer_conv', False))} "
+        f"use_balance_se={bool(getattr(model, 'use_balance_se', False))} "
+        f"use_tfa_pooling={bool(getattr(model, 'use_tfa_pooling', False))}"
     )
     optimizer = build_optimizer(cfg=cfg, model=model)
     log_optimizer_groups(optimizer)
@@ -430,7 +451,7 @@ def main() -> None:
             start_epoch = 1
             best_val_f1 = -1.0
             stagewise_multimodal_finetune = bool(
-                cfg.model.use_audio_branch and cfg.model.use_video_branch
+                model_use_audio_branch and model_use_video_branch
             )
             print(
                 "[Runtime] 已丢弃旧的 epoch 记录：从 Epoch 1 + 初始学习率启动新的微调流程"

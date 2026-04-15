@@ -340,6 +340,8 @@ class TFAConformerBlock(nn.Module):
         conv_kernel_t: int = 17,
         conv_kernel_f: int = 3,
         dropout: float = 0.1,
+        use_tfa_pooling: bool = True,
+        use_conformer_conv: bool = True,
     ) -> None:
         super().__init__()
         self.norm_attn = LayerNorm2d(channels)
@@ -347,25 +349,37 @@ class TFAConformerBlock(nn.Module):
         self.norm_conv = LayerNorm2d(channels)
         self.norm_ffn = LayerNorm2d(channels)
         self.out_norm = LayerNorm2d(channels)
+        self.use_tfa_pooling = bool(use_tfa_pooling)
+        self.use_conformer_conv = bool(use_conformer_conv)
 
         self.attn = TemporalSelfAttention(channels=channels, num_heads=num_heads, dropout=dropout)
-        self.tfa_pool = TimeFrequencyAttentionPooling(
-            branch_channels=32,
-            kernel_size=7,
-            dilation=3,
+        self.tfa_pool = (
+            TimeFrequencyAttentionPooling(
+                branch_channels=32,
+                kernel_size=7,
+                dilation=3,
+            )
+            if self.use_tfa_pooling
+            else None
         )
-        self.conv = PointDepthwiseSeparableConv2d(
-            channels=channels,
-            kernel_t=conv_kernel_t,
-            kernel_f=conv_kernel_f,
-            dropout=dropout,
+        self.conv = (
+            PointDepthwiseSeparableConv2d(
+                channels=channels,
+                kernel_t=conv_kernel_t,
+                kernel_f=conv_kernel_f,
+                dropout=dropout,
+            )
+            if self.use_conformer_conv
+            else None
         )
         self.ffn = FFN2d(channels=channels, mult=ff_mult, dropout=dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.norm_attn(x))
-        x = x + 0.5 * self.tfa_pool(self.norm_tfa(x))[0]
-        x = x + 0.5 * self.conv(self.norm_conv(x))
+        if self.tfa_pool is not None:
+            x = x + 0.5 * self.tfa_pool(self.norm_tfa(x))[0]
+        if self.conv is not None:
+            x = x + 0.5 * self.conv(self.norm_conv(x))
         x = x + self.ffn(self.norm_ffn(x))
         return self.out_norm(x)
 
@@ -382,6 +396,8 @@ class MultiScaleTFAEncoder(nn.Module):
         conv_kernel_t: int = 17,
         conv_kernel_f: int = 3,
         dropout: float = 0.1,
+        use_tfa_pooling: bool = True,
+        use_conformer_conv: bool = True,
     ) -> None:
         super().__init__()
         self.blocks = nn.ModuleList(
@@ -393,6 +409,8 @@ class MultiScaleTFAEncoder(nn.Module):
                     conv_kernel_t=conv_kernel_t,
                     conv_kernel_f=conv_kernel_f,
                     dropout=dropout,
+                    use_tfa_pooling=use_tfa_pooling,
+                    use_conformer_conv=use_conformer_conv,
                 )
                 for _ in range(num_blocks)
             ]
@@ -420,13 +438,21 @@ class MultiScaleTFAEncoder(nn.Module):
 class CompressionExcitationBalance(nn.Module):
     """Compression-excitation temporal balance module."""
 
-    def __init__(self, channels: int, reduction: int = 8) -> None:
+    def __init__(self, channels: int, reduction: int = 8, use_se: bool = True) -> None:
         super().__init__()
-        hidden = max(8, channels // reduction)
-        self.fc1 = nn.Linear(channels, hidden)
-        self.fc2 = nn.Linear(hidden, channels)
+        self.use_se = bool(use_se)
+        if self.use_se:
+            hidden = max(8, channels // reduction)
+            self.fc1 = nn.Linear(channels, hidden)
+            self.fc2 = nn.Linear(hidden, channels)
+        else:
+            self.fc1 = None
+            self.fc2 = None
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_se:
+            gate = x.new_ones((x.size(0), x.size(1)))
+            return x, gate
         h = x.mean(dim=3)  # [B, C, T]
         mu = h.mean(dim=2)  # [B, C]
         gate = torch.sigmoid(self.fc2(F.relu(self.fc1(mu), inplace=True)))  # [B, C]
@@ -436,13 +462,21 @@ class CompressionExcitationBalance(nn.Module):
 class ClassifierSEBlock(nn.Module):
     """Extra SE block before classifier head."""
 
-    def __init__(self, channels: int, reduction: int = 8) -> None:
+    def __init__(self, channels: int, reduction: int = 8, use_se: bool = True) -> None:
         super().__init__()
-        hidden = max(8, channels // reduction)
-        self.fc1 = nn.Linear(channels, hidden)
-        self.fc2 = nn.Linear(hidden, channels)
+        self.use_se = bool(use_se)
+        if self.use_se:
+            hidden = max(8, channels // reduction)
+            self.fc1 = nn.Linear(channels, hidden)
+            self.fc2 = nn.Linear(hidden, channels)
+        else:
+            self.fc1 = None
+            self.fc2 = None
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_se:
+            gate = x.new_ones((x.size(0), x.size(1)))
+            return x, gate
         gate = torch.sigmoid(self.fc2(F.relu(self.fc1(x.mean(dim=(2, 3))), inplace=True)))
         return x * gate[:, :, None, None], gate
 
@@ -513,6 +547,9 @@ class AdaptiveModalFusion(nn.Module):
 
 @dataclass
 class ModelConfig:
+    # 主模型 / baseline 选择：
+    # tfa_multiscale_conformer | ecapa_tdnn | resnet_xvector | mfa_conformer
+    backbone_type: str = "tfa_multiscale_conformer"
     num_speakers: int = 855
     in_channels: int = 1
     feature_channels: int = 512
@@ -533,7 +570,18 @@ class ModelConfig:
     use_video_branch: bool = True
     use_attention_aggregation: bool = True
     use_adaptive_fusion: bool = True
+    use_conformer_conv: bool = True
+    use_balance_se: bool = True
+    use_tfa_pooling: bool = True
     dropout: float = 0.1
+    # baseline 参数对齐开关：默认按当前 TFA 模型参数量自动搜索最接近配置
+    auto_match_baseline_params: bool = True
+    # >0 时强制使用该参数预算；<=0 时自动以当前 TFA 配置为预算
+    baseline_target_params: int = 0
+    baseline_ecapa_channels: int = 512
+    baseline_resnet_base_channels: int = 48
+    baseline_mfa_conformer_dim: int = 256
+    baseline_mfa_num_blocks: int = 6
 
 
 class TFAMultiScaleConformerSpeakerNet(nn.Module):
@@ -567,10 +615,13 @@ class TFAMultiScaleConformerSpeakerNet(nn.Module):
                 conv_kernel_t=cfg.conv_kernel_t,
                 conv_kernel_f=cfg.conv_kernel_f,
                 dropout=cfg.dropout,
+                use_tfa_pooling=cfg.use_tfa_pooling,
+                use_conformer_conv=cfg.use_conformer_conv,
             )
             self.ce_balance = CompressionExcitationBalance(
                 channels=cfg.feature_channels,
                 reduction=cfg.ce_reduction,
+                use_se=cfg.use_balance_se,
             )
             self.classifier_se = ClassifierSEBlock(
                 channels=cfg.feature_channels,

@@ -61,13 +61,21 @@ data/video_roi/<speaker_id>/*.mp4  # 可选，用于视频分支
 - `data.musan_*`（MUSAN 增强开关、路径、SNR 范围、增强概率）
 - `data.video_*`（视频分支开关、路径、帧数、ROI 尺寸）
 - `train.modality_drop_*`（训练阶段音频/视频整分支随机置零概率）
-- `model.use_*`（音频/视频分支、注意力聚合、自适应融合的消融开关）
+- `model.use_*`（分支级开关 + 论文 `-Conv/-SE/-TFA` 消融开关）
 
 ## 训练
 
 ```bash
 python train.py --config configs/paper_experiment.yaml
 ```
+
+现已支持在同一训练脚本中切换 3 个 baseline（统一复用 ArcFace/CosFace 训练头）：
+
+- `model.backbone_type: "ecapa_tdnn"`
+- `model.backbone_type: "resnet_xvector"`
+- `model.backbone_type: "mfa_conformer"`
+
+为了做更严格控制变量，默认启用 `model.auto_match_baseline_params: true`，会自动将 baseline 的通道宽度搜索到与当前 TFA 配置最接近的参数量（也可用 `model.baseline_target_params` 手动指定预算）。
 
 支持主流分类损失配置（`train.loss_type`）：
 
@@ -80,6 +88,12 @@ python train.py --config configs/paper_experiment.yaml
 ```bash
 python train.py --config configs/paper_experiment.yaml --resume runs/<run_name>/last.pt
 ```
+
+论文消融实验可通过以下配置开关直接控制：
+
+- `-Conv`：`model.use_conformer_conv: false`
+- `-SE`：`model.use_balance_se: false`（关闭块级特征均衡模块的 SE 门控）
+- `-TFA`：`model.use_tfa_pooling: false`
 
 ## 评估
 

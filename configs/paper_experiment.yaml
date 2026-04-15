@@ -56,8 +56,19 @@ feature:
   cmvn: true
 
 model:
+  # 骨干网络：tfa_multiscale_conformer | ecapa_tdnn | resnet_xvector | mfa_conformer
+  backbone_type: "tfa_multiscale_conformer"
+  # baseline 参数对齐：true 时自动搜索最接近当前 TFA 参数量的宽度
+  auto_match_baseline_params: true
+  # >0 使用固定参数预算；<=0 自动使用当前 TFA 配置参数量作为预算
+  baseline_target_params: 0
   # num_speakers 会在训练时自动覆盖为扫描到的说话人数
   num_speakers: 855
+  # 三个 baseline 的初始宽度（自动参数匹配时作为搜索中心）
+  baseline_ecapa_channels: 512
+  baseline_resnet_base_channels: 48
+  baseline_mfa_conformer_dim: 256
+  baseline_mfa_num_blocks: 6
   in_channels: 1
   feature_channels: 256
   res2_scale: 6
@@ -79,6 +90,10 @@ model:
   use_video_branch: true
   use_attention_aggregation: true
   use_adaptive_fusion: true
+  # 论文消融：-Conv / -SE / -TFA 分别将下面三项设为 false
+  use_conformer_conv: true
+  use_balance_se: true
+  use_tfa_pooling: true
   dropout: 0.1
 
 train:
