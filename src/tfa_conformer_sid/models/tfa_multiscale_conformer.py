@@ -488,7 +488,11 @@ def _build_resnet18_backbone() -> nn.Module:
         raise ImportError(
             "视频分支依赖 torchvision，请安装：pip install torchvision"
         ) from exc
-    backbone = tv_models.resnet18(weights=None)
+    try:
+        backbone = tv_models.resnet18(weights=tv_models.ResNet18_Weights.DEFAULT)
+    except AttributeError:
+        # 兼容旧版 torchvision（<0.13）的 pretrained 参数接口
+        backbone = tv_models.resnet18(pretrained=True)
     backbone.fc = nn.Identity()
     return backbone
 
