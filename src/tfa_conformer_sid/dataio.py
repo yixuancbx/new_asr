@@ -91,7 +91,25 @@ class AudioFeatureExtractor:
         self.musan_snr_max_db = float(data_cfg.musan_snr_max_db)
         if self.musan_snr_min_db > self.musan_snr_max_db:
             raise ValueError("data.musan_snr_min_db 不能大于 data.musan_snr_max_db")
-        self.musan_paths = self._scan_musan_paths() if self.musan_enable else []
+        self.musan_paths = self._scan_musan_paths() if data_cfg.musan_roots else []
+        self.eval_musan_enable = False
+        self.eval_musan_prob = 1.0
+        self.eval_musan_snr_db: float | None = None
+
+    def configure_eval_musan(
+        self,
+        enable: bool,
+        snr_db: float | None = None,
+        prob: float = 1.0,
+    ) -> None:
+        """
+        Configure MUSAN injection in evaluation/inference.
+
+        Note: noise is always added on raw waveform before feature extraction.
+        """
+        self.eval_musan_enable = bool(enable)
+        self.eval_musan_snr_db = None if snr_db is None else float(snr_db)
+        self.eval_musan_prob = min(max(float(prob), 0.0), 1.0)
 
     def _scan_musan_paths(self) -> List[Path]:
         extensions = _normalize_extensions(self.data_cfg.musan_extensions)
@@ -150,11 +168,24 @@ class AudioFeatureExtractor:
         return noise
 
     def _apply_musan(self, wave: torch.Tensor, training: bool) -> torch.Tensor:
-        if not training or not self.musan_enable:
-            return wave
         if not self.musan_paths:
             return wave
-        if random.random() > self.musan_prob:
+
+        if training:
+            if not self.musan_enable:
+                return wave
+            apply_prob = self.musan_prob
+            snr = random.uniform(self.musan_snr_min_db, self.musan_snr_max_db)
+        else:
+            if not self.eval_musan_enable:
+                return wave
+            apply_prob = self.eval_musan_prob
+            if self.eval_musan_snr_db is None:
+                snr = random.uniform(self.musan_snr_min_db, self.musan_snr_max_db)
+            else:
+                snr = float(self.eval_musan_snr_db)
+
+        if random.random() > apply_prob:
             return wave
 
         noise_path = random.choice(self.musan_paths)
@@ -164,7 +195,6 @@ class AudioFeatureExtractor:
             return wave
 
         noise = self._fit_noise_to_target(noise, target_len=int(wave.numel()))
-        snr = random.uniform(self.musan_snr_min_db, self.musan_snr_max_db)
 
         speech_rms = wave.pow(2).mean().sqrt().clamp_min(1e-6)
         noise_rms = noise.pow(2).mean().sqrt().clamp_min(1e-6)

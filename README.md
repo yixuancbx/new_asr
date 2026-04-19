@@ -95,10 +95,37 @@ python train.py --config configs/paper_experiment.yaml --resume runs/<run_name>/
 - `-SE`：`model.use_balance_se: false`（关闭块级特征均衡模块的 SE 门控）
 - `-TFA`：`model.use_tfa_pooling: false`
 
-## 评估
+## 评估（多 SNR 衰减曲线）
 
 ```bash
 python evaluate.py --config configs/paper_experiment.yaml --checkpoint runs/<run_name>/best.pt
+```
+
+支持循环评估多个 SNR，并可一次评估多个模型（用于横向对比）：
+
+```bash
+python evaluate.py \
+  --config configs/paper_experiment.yaml \
+  --checkpoints "TFA=runs/tfa/best.pt" "ECAPA=runs/ecapa/best.pt" "ResNet=runs/resnet/best.pt" \
+  --snr-list "clean,20,15,10,5,0,-5" \
+  --seed 42 \
+  --output-csv runs/snr_eval/all_models.csv \
+  --per-model-csv-dir runs/snr_eval/per_model
+```
+
+说明：
+
+- `--snr-list` 支持 `clean`，其余值按 dB 解析。
+- 评估阶段噪声在**原始 waveform 上**施加，之后再提取 MFCC/Fbank（保持物理意义）。
+- 为保证控制变量，脚本会按 SNR 固定随机种子；同一个 SNR 下，不同模型会看到一致的噪声采样片段。
+
+在拿到各模型 CSV 后，使用可视化脚本绘制“随 SNR 下降的性能衰减曲线”：
+
+```bash
+python plot_snr_decay.py \
+  --csv-files runs/snr_eval/per_model/TFA.csv runs/snr_eval/per_model/ECAPA.csv runs/snr_eval/per_model/ResNet.csv \
+  --metric f1 \
+  --output runs/snr_eval/f1_decay.png
 ```
 
 ## 说明

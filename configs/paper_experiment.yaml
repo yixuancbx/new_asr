@@ -27,7 +27,7 @@ data:
   eval_batch_size: 4
   num_workers: 4
   pin_memory: true
-  # MUSAN 噪声增强（仅训练阶段生效）
+  # MUSAN 噪声增强（训练使用；evaluate.py 可在推断阶段动态覆盖 SNR）
   musan_enable: true
   musan_roots:
     - "D:\\VPN\\musan"
